@@ -549,3 +549,323 @@ func TestFetchRepositoryContentsProbeTruncatedTreeFallsBackToRootOnly(t *testing
 		t.Fatalf("a 404 on dependabot.yml must leave config-known false, not a confirmed absence used as a known 'no groups': %+v", result)
 	}
 }
+
+// TestFetchRepositoryCodeScanningAnalysesObservesCodeQLAcrossPaginatedHistory
+// confirms the analyses list is fully paginated (two pages), a non-CodeQL
+// tool entry is counted but does not mark CodeQLAnalysisObserved, and the
+// most recent CodeQL analysis timestamp is the true maximum across both
+// pages, not merely the first page's own maximum (the second, later page
+// here carries the genuinely most recent CodeQL entry). Every entry
+// carries an explicit empty "error" (a successful analysis) and a
+// default-branch ref, within the [since, now) window.
+func TestFetchRepositoryCodeScanningAnalysesObservesCodeQLAcrossPaginatedHistory(t *testing.T) {
+	base := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	since, now := base.Add(-24*time.Hour), base.Add(168*time.Hour)
+	var server *httptest.Server
+	server = httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Query().Get("page") == "2" {
+			writeJSON(t, writer, []map[string]any{
+				{"tool": map[string]any{"name": "CodeQL"}, "created_at": base.Add(72 * time.Hour).Format(time.RFC3339),
+					"ref": "refs/heads/main", "error": ""},
+			})
+			return
+		}
+		writer.Header().Set("Link", "<"+server.URL+"/repos/fixture-org/widget/code-scanning/analyses?per_page=100&page=2>; rel=\"next\"")
+		writeJSON(t, writer, []map[string]any{
+			{"tool": map[string]any{"name": "CodeQL"}, "created_at": base.Format(time.RFC3339), "ref": "refs/heads/main", "error": ""},
+			{"tool": map[string]any{"name": "eslint-security"}, "created_at": base.Add(time.Hour).Format(time.RFC3339),
+				"ref": "refs/heads/main", "error": ""},
+		})
+	}))
+	t.Cleanup(server.Close)
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	scope := Scope{client.base.Hostname(), RepositoryScope, "fixture-org/widget"}
+
+	result, outcome, err := FetchRepositoryCodeScanningAnalyses(context.Background(), client, store, scope, "fixture-org", "widget", "main", since, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Complete || !outcome.Complete {
+		t.Fatalf("expected a fully valid two-page history to be complete: %+v / %+v", result, outcome)
+	}
+	if !result.CodeQLAnalysisObserved {
+		t.Fatalf("expected a CodeQL tool entry to be observed: %+v", result)
+	}
+	if result.TotalAnalysesObserved != 3 {
+		t.Fatalf("expected all 3 valid entries across both pages counted, not just one page: %+v", result)
+	}
+	wantMostRecent := base.Add(72 * time.Hour)
+	if result.MostRecentCodeQLAnalysisAt == nil || !result.MostRecentCodeQLAnalysisAt.Equal(wantMostRecent) {
+		t.Fatalf("expected the most recent CodeQL timestamp to be the true maximum across both pages (%s): %+v", wantMostRecent, result)
+	}
+}
+
+// TestFetchRepositoryCodeScanningAnalysesNoCodeQLToolPresent confirms a
+// repository whose only configured scanning tool is not CodeQL correctly
+// reports CodeQLAnalysisObserved false (not true merely because the
+// endpoint itself returned analyses at all).
+func TestFetchRepositoryCodeScanningAnalysesNoCodeQLToolPresent(t *testing.T) {
+	created := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, writer, []map[string]any{
+			{"tool": map[string]any{"name": "eslint-security"}, "created_at": created.Format(time.RFC3339), "ref": "refs/heads/main", "error": ""},
+		})
+	}))
+	t.Cleanup(server.Close)
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	scope := Scope{client.base.Hostname(), RepositoryScope, "fixture-org/widget"}
+
+	result, _, err := FetchRepositoryCodeScanningAnalyses(context.Background(), client, store, scope, "fixture-org", "widget", "main",
+		created.Add(-time.Hour), created.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CodeQLAnalysisObserved || result.MostRecentCodeQLAnalysisAt != nil {
+		t.Fatalf("a non-CodeQL-only analyses history must not report CodeQL as observed: %+v", result)
+	}
+	if !result.Complete || result.TotalAnalysesObserved != 1 {
+		t.Fatalf("expected the single valid non-CodeQL entry counted and complete: %+v", result)
+	}
+}
+
+// TestFetchRepositoryCodeScanningAnalysesMalformedEntryMarksIncomplete
+// confirms an entry missing its documented tool.name, created_at, ref or
+// error downgrades Complete (both the typed result and the
+// CollectorOutcome, per markOutcomeIncomplete) rather than being silently
+// dropped as if the endpoint had simply never returned it.
+func TestFetchRepositoryCodeScanningAnalysesMalformedEntryMarksIncomplete(t *testing.T) {
+	created := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, writer, []map[string]any{
+			{"tool": map[string]any{"name": "CodeQL"}, "created_at": created.Format(time.RFC3339), "ref": "refs/heads/main", "error": ""},
+			{"tool": map[string]any{}, "created_at": created.Format(time.RFC3339), "ref": "refs/heads/main", "error": ""},
+			{"tool": map[string]any{"name": "CodeQL"}, "ref": "refs/heads/main", "error": ""},
+		})
+	}))
+	t.Cleanup(server.Close)
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	scope := Scope{client.base.Hostname(), RepositoryScope, "fixture-org/widget"}
+
+	result, outcome, err := FetchRepositoryCodeScanningAnalyses(context.Background(), client, store, scope, "fixture-org", "widget", "main",
+		created.Add(-time.Hour), created.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Complete {
+		t.Fatalf("expected malformed entries (missing tool.name / created_at) to mark the result incomplete: %+v", result)
+	}
+	if outcome.Complete || outcome.Reason == "" {
+		t.Fatalf("expected the semantic failure to be disclosed on the outcome itself, not only the typed result: %+v", outcome)
+	}
+	if !result.CodeQLAnalysisObserved || result.TotalAnalysesObserved != 1 {
+		t.Fatalf("expected the one well-formed CodeQL entry still counted despite the other malformed entries: %+v", result)
+	}
+}
+
+// TestFetchRepositoryCodeScanningAnalysesForbiddenLeavesUnknown confirms a
+// 403 (GitHub Advanced Security not enabled, or the credential lacks
+// security_events scope) leaves the result unknown (Complete false, zero
+// observations) rather than a false "no analyses" -- matching
+// FetchRepositoryCodeScanningDefaultSetup's own documented contract -- with
+// the forbidden access disclosed on the outcome's Availability, and no Go
+// error returned (a collection-layer failure is conveyed through the
+// outcome/result, never propagated as a hard error for this collector).
+func TestFetchRepositoryCodeScanningAnalysesForbiddenLeavesUnknown(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusForbidden)
+		writeJSON(t, writer, map[string]string{"message": "advanced security must be enabled for this repository"})
+	}))
+	t.Cleanup(server.Close)
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	scope := Scope{client.base.Hostname(), RepositoryScope, "fixture-org/widget"}
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+
+	result, outcome, err := FetchRepositoryCodeScanningAnalyses(context.Background(), client, store, scope, "fixture-org", "widget", "main",
+		now.Add(-time.Hour), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Complete || result.CodeQLAnalysisObserved || result.TotalAnalysesObserved != 0 {
+		t.Fatalf("a forbidden probe must report unknown status, not a false clean zero: %+v", result)
+	}
+	if outcome.Availability != MissingPermission {
+		t.Fatalf("expected the outcome to disclose the forbidden access: %+v", outcome)
+	}
+}
+
+// TestFetchRepositoryCodeScanningAnalysesErrorBearingEntryIsNotPositive
+// migrates main's own reproduction overlay: a genuine-shaped CodeQL entry
+// (correct tool, correct default-branch ref, a timestamp inside the window)
+// whose documented "error" field is non-empty is an explicitly FAILED
+// analysis attempt and must never establish CodeQLAnalysisObserved, no
+// matter how otherwise well-formed the entry looks.
+func TestFetchRepositoryCodeScanningAnalysesErrorBearingEntryIsNotPositive(t *testing.T) {
+	created := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, writer, []map[string]any{
+			{"id": 1, "tool": map[string]any{"name": "CodeQL"}, "ref": "refs/heads/main",
+				"created_at": created.Format(time.RFC3339), "error": "analysis could not be processed", "results_count": 0},
+		})
+	}))
+	t.Cleanup(server.Close)
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	scope := Scope{client.base.Hostname(), RepositoryScope, "fixture-org/widget"}
+
+	result, _, err := FetchRepositoryCodeScanningAnalyses(context.Background(), client, store, scope, "fixture-org", "widget", "main",
+		created.Add(-time.Hour), created.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CodeQLAnalysisObserved {
+		t.Fatalf("an explicitly failed CodeQL analysis cannot establish successful operational coverage: %+v", result)
+	}
+	if !result.Complete || result.TotalAnalysesObserved != 1 {
+		t.Fatalf("a well-formed (if failed) entry is still a valid, complete, counted observation: %+v", result)
+	}
+}
+
+// TestFetchRepositoryCodeScanningAnalysesNonDefaultBranchRefIsNotPositive
+// confirms a genuinely successful CodeQL analysis on a pull-request-only
+// ref (or any ref other than the repository's own default branch) does not
+// establish the default branch's own operational status.
+func TestFetchRepositoryCodeScanningAnalysesNonDefaultBranchRefIsNotPositive(t *testing.T) {
+	created := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, writer, []map[string]any{
+			{"tool": map[string]any{"name": "CodeQL"}, "ref": "refs/pull/42/merge", "created_at": created.Format(time.RFC3339), "error": ""},
+		})
+	}))
+	t.Cleanup(server.Close)
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	scope := Scope{client.base.Hostname(), RepositoryScope, "fixture-org/widget"}
+
+	result, _, err := FetchRepositoryCodeScanningAnalyses(context.Background(), client, store, scope, "fixture-org", "widget", "main",
+		created.Add(-time.Hour), created.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CodeQLAnalysisObserved {
+		t.Fatalf("a pull-request-only (non-default-branch) ref must not establish default-branch operational status: %+v", result)
+	}
+	if !result.Complete || result.TotalAnalysesObserved != 1 {
+		t.Fatalf("the entry is still well-formed and counted, just not positive for this branch: %+v", result)
+	}
+}
+
+// TestFetchRepositoryCodeScanningAnalysesZeroResultsCountIsStillPositive
+// confirms a genuine, successful (empty error) CodeQL analysis that simply
+// found zero findings is still positive evidence -- a clean scan, not a
+// failure -- matching the documented results_count field's own semantics.
+func TestFetchRepositoryCodeScanningAnalysesZeroResultsCountIsStillPositive(t *testing.T) {
+	created := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, writer, []map[string]any{
+			{"tool": map[string]any{"name": "CodeQL"}, "ref": "refs/heads/main", "created_at": created.Format(time.RFC3339),
+				"error": "", "results_count": 0},
+		})
+	}))
+	t.Cleanup(server.Close)
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	scope := Scope{client.base.Hostname(), RepositoryScope, "fixture-org/widget"}
+
+	result, _, err := FetchRepositoryCodeScanningAnalyses(context.Background(), client, store, scope, "fixture-org", "widget", "main",
+		created.Add(-time.Hour), created.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.CodeQLAnalysisObserved {
+		t.Fatalf("a clean (zero-finding) successful analysis is still positive evidence of operational status: %+v", result)
+	}
+}
+
+// TestFetchRepositoryCodeScanningAnalysesWindowExcludesOutOfRangeTimestamps
+// confirms the [since, now) window is bound to the caller's explicit
+// arguments, not a live wall-clock call: an entry dated before since and
+// another dated at-or-after now are both excluded, while one genuinely
+// inside the window is observed -- the same frozen-clock determinism every
+// other lookback-windowed collector in this package already depends on for
+// reproducible replay.
+func TestFetchRepositoryCodeScanningAnalysesWindowExcludesOutOfRangeTimestamps(t *testing.T) {
+	since := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	now := since.Add(72 * time.Hour)
+	tooOld := since.Add(-time.Minute)
+	tooNew := now
+	inWindow := since.Add(time.Hour)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, writer, []map[string]any{
+			{"tool": map[string]any{"name": "CodeQL"}, "ref": "refs/heads/main", "created_at": tooOld.Format(time.RFC3339), "error": ""},
+			{"tool": map[string]any{"name": "CodeQL"}, "ref": "refs/heads/main", "created_at": tooNew.Format(time.RFC3339), "error": ""},
+			{"tool": map[string]any{"name": "CodeQL"}, "ref": "refs/heads/main", "created_at": inWindow.Format(time.RFC3339), "error": ""},
+		})
+	}))
+	t.Cleanup(server.Close)
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	scope := Scope{client.base.Hostname(), RepositoryScope, "fixture-org/widget"}
+
+	result, _, err := FetchRepositoryCodeScanningAnalyses(context.Background(), client, store, scope, "fixture-org", "widget", "main", since, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.CodeQLAnalysisObserved {
+		t.Fatalf("expected the single genuinely in-window entry to be observed: %+v", result)
+	}
+	if result.MostRecentCodeQLAnalysisAt == nil || !result.MostRecentCodeQLAnalysisAt.Equal(inWindow) {
+		t.Fatalf("expected the out-of-window entries (before since, at/after now) excluded from the most-recent determination: %+v", result)
+	}
+}
+
+// TestFetchRepositoryCodeScanningDefaultSetupEmptyStateIsUnknown confirms an
+// empty/omitted documented "state" field (neither of the three documented
+// enum values) leaves enablement unknown rather than a false "not
+// configured" -- the exact gap an empty-object {} response previously
+// coerced into a confident false via GetState() == "" == "configured".
+func TestFetchRepositoryCodeScanningDefaultSetupEmptyStateIsUnknown(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, writer, map[string]any{})
+	}))
+	t.Cleanup(server.Close)
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	scope := Scope{client.base.Hostname(), RepositoryScope, "fixture-org/widget"}
+
+	configured, outcome, err := FetchRepositoryCodeScanningDefaultSetup(context.Background(), client, store, scope, "fixture-org", "widget")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configured != nil {
+		t.Fatalf("an empty/omitted state field must report unknown enablement, not a value: %v", *configured)
+	}
+	if outcome.Complete || outcome.Reason == "" {
+		t.Fatalf("expected the semantic gap to be disclosed on the outcome: %+v", outcome)
+	}
+}
+
+// TestFetchRepositoryCodeScanningDefaultSetupNotAvailableIsKnownFalse
+// confirms the documented "not-available" state value (distinct from
+// "not-configured") is still a confident, known false -- not conflated with
+// the empty/unrecognized-value unknown case above.
+func TestFetchRepositoryCodeScanningDefaultSetupNotAvailableIsKnownFalse(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, writer, map[string]any{"state": "not-available"})
+	}))
+	t.Cleanup(server.Close)
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	scope := Scope{client.base.Hostname(), RepositoryScope, "fixture-org/widget"}
+
+	configured, _, err := FetchRepositoryCodeScanningDefaultSetup(context.Background(), client, store, scope, "fixture-org", "widget")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configured == nil || *configured {
+		t.Fatalf("\"not-available\" is a documented, confident false, not unknown: %v", configured)
+	}
+}

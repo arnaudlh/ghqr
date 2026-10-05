@@ -5,9 +5,11 @@ package assessment
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/go-github/v83/github"
 	"gopkg.in/yaml.v3"
@@ -275,8 +277,15 @@ func repositoriesFeatureName(configurationID int64) string {
 // FetchRepositoryCodeScanningDefaultSetup reports whether GitHub's native
 // code-scanning default setup is configured for this repository, distinct
 // from a custom `github/codeql-action` workflow step (AnalyzeRepositoryWorkflows'
-// CodeQLOperational signal). A concealed/failed probe leaves enablement
-// unknown rather than assuming disabled.
+// CodeQLOperational signal) and distinct from the repository's own recorded
+// analysis history (FetchRepositoryCodeScanningAnalyses): "configured" is
+// enablement, not evidence a scan has actually succeeded yet (a newly
+// configured repository's first scheduled scan can still be pending). The
+// documented `state` enum is exactly "configured", "not-configured" or
+// "not-available" (https://docs.github.com/en/rest/code-scanning/code-scanning
+// #get-a-code-scanning-default-setup-configuration); an empty/omitted or any
+// other unrecognized state value leaves enablement unknown rather than a
+// false "not configured".
 func FetchRepositoryCodeScanningDefaultSetup(ctx context.Context, client *CollectionClient, store *EvidenceStore, scope Scope,
 	owner, repo string) (*bool, CollectorOutcome, error) {
 	setup, outcome, err := collectJSONObject[github.DefaultSetupConfiguration](ctx, client, store, scope,
@@ -284,8 +293,106 @@ func FetchRepositoryCodeScanningDefaultSetup(ctx context.Context, client *Collec
 	if err != nil || setup == nil {
 		return nil, outcome, nil
 	}
-	configured := setup.GetState() == "configured"
-	return &configured, outcome, nil
+	switch setup.GetState() {
+	case "configured":
+		configured := true
+		return &configured, outcome, nil
+	case "not-configured", "not-available":
+		configured := false
+		return &configured, outcome, nil
+	default:
+		return nil, markOutcomeIncomplete(outcome, "default-setup state field was missing or carried an unrecognized value"), nil
+	}
+}
+
+// RepositoryCodeScanningAnalysesResult reports whether a repository's actual
+// code-scanning analysis history (GET /repos/{owner}/{repo}/code-scanning/analyses,
+// fully paginated) genuinely includes a SUCCESSFUL CodeQL analysis on the
+// repository's own default branch within the analyzed window -- this
+// package's authoritative, evidence-backed signal for CodeQL operational
+// status, distinct from (and more reliable than) merely observing that a
+// workflow file references the github/codeql-action step, or that native
+// default setup is merely "configured": both of those are enablement
+// signals, neither proves a scan has ever actually completed successfully.
+// An entry whose documented `error` field (https://docs.github.com/en/rest/
+// code-scanning/code-scanning#list-code-scanning-analyses-for-a-repository)
+// is non-empty is an explicitly FAILED analysis attempt and can never count
+// as positive evidence, regardless of its tool/ref/timestamp; a zero
+// results_count is still a legitimate, successful, clean analysis (no
+// findings), not a failure. A PR-only, stale, or future-dated ref/timestamp
+// outside the caller's chosen [since, now) window also does not count
+// toward CodeQLAnalysisObserved -- that window is this package's own
+// deliberate scope choice (bounding the signal to currently-relevant
+// activity on the branch that matters), not a constraint GitHub's API
+// itself imposes. A malformed entry (missing its documented tool.name,
+// created_at, ref or error field) downgrades Complete rather than being
+// silently skipped as if it had never been returned at all.
+type RepositoryCodeScanningAnalysesResult struct {
+	CodeQLAnalysisObserved     bool       `json:"codeql_analysis_observed"`
+	MostRecentCodeQLAnalysisAt *time.Time `json:"most_recent_codeql_analysis_at"`
+	TotalAnalysesObserved      int        `json:"total_analyses_observed"`
+	Complete                   bool       `json:"complete"`
+}
+
+// FetchRepositoryCodeScanningAnalyses collects the repository's complete
+// (fully paginated) code-scanning analysis history and validates every
+// entry against defaultBranch and the explicit [since, now) window (both
+// supplied by the caller -- now must be the run's own frozen clock value,
+// never a live time.Now() call, so a replayed run reproduces the identical
+// window). A 403 (GitHub Advanced Security not enabled for this repository)
+// or any other non-2xx response leaves the result incomplete (Complete
+// false, zero observations) rather than a false "no analyses" -- the
+// returned CollectorOutcome's Availability still discloses why, matching
+// every other array collector in this package (for example
+// FetchRepositoryActionsRuns): a collection error never propagates as a Go
+// error from this function, only as an incomplete result.
+func FetchRepositoryCodeScanningAnalyses(ctx context.Context, client *CollectionClient, store *EvidenceStore, scope Scope,
+	owner, repo, defaultBranch string, since, now time.Time) (RepositoryCodeScanningAnalysesResult, CollectorOutcome, error) {
+	analyses, outcome, err := collectJSONArray[*github.ScanningAnalysis](ctx, client, store, scope,
+		"repo.code_scanning", "analyses", "repos/"+url.PathEscape(owner)+"/"+url.PathEscape(repo)+"/code-scanning/analyses", "", true)
+	if err != nil {
+		return RepositoryCodeScanningAnalysesResult{}, outcome, nil
+	}
+	result := RepositoryCodeScanningAnalysesResult{Complete: true}
+	defaultBranchRef := ""
+	if defaultBranch != "" {
+		defaultBranchRef = "refs/heads/" + defaultBranch
+	}
+	malformed := 0
+	for _, analysis := range analyses {
+		if analysis == nil || analysis.Tool == nil || analysis.Tool.Name == nil || analysis.GetTool().GetName() == "" ||
+			analysis.CreatedAt == nil || analysis.Ref == nil || analysis.Error == nil {
+			result.Complete = false
+			malformed++
+			continue
+		}
+		result.TotalAnalysesObserved++
+		if analysis.GetTool().GetName() != "CodeQL" {
+			continue
+		}
+		createdAt := analysis.CreatedAt.Time
+		// A non-empty error is a documented, explicitly failed analysis
+		// attempt (for example the SARIF upload could not be processed):
+		// never positive evidence, regardless of ref/timestamp. A ref that
+		// is not this repository's own default branch (a pull-request-only
+		// analysis, or a different branch entirely) is also not evidence
+		// the default branch itself is operational. A timestamp outside
+		// the caller's [since, now) window is excluded as this package's
+		// own deliberate recency scope, not a GitHub-imposed rule.
+		if analysis.GetError() != "" || (defaultBranchRef != "" && analysis.GetRef() != defaultBranchRef) ||
+			createdAt.Before(since) || !createdAt.Before(now) {
+			continue
+		}
+		result.CodeQLAnalysisObserved = true
+		if result.MostRecentCodeQLAnalysisAt == nil || createdAt.After(*result.MostRecentCodeQLAnalysisAt) {
+			result.MostRecentCodeQLAnalysisAt = &createdAt
+		}
+	}
+	if malformed > 0 {
+		outcome = markOutcomeIncomplete(outcome, fmt.Sprintf(
+			"%d of %d analyses entries were missing their documented tool.name, created_at, ref or error field", malformed, len(analyses)))
+	}
+	return result, outcome, nil
 }
 
 // supportedManifestFilenames mirrors the repo.contents_probe collector's

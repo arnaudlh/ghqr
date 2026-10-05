@@ -65,7 +65,7 @@ type metricAccumulator struct {
 	ruleTypeCoverage           map[string]float64
 	activeOrganizationRulesets map[string]bool
 	references                 []ActionReference
-	featureSignals             []RepositoryFeatureSignal
+	featureSignals             observationBucket[RepositoryFeatureSignal]
 
 	// Phase 4 operational/security/governance additions. Each bucket is
 	// populated by the run loop (vertical_slice.go) calling the matching
@@ -166,6 +166,7 @@ func newMetricAccumulator() *metricAccumulator {
 		pullRequests: newObservationBucket[PullRequestObservation](), actionsRuns: newObservationBucket[WorkflowRunObservation](),
 		dependabot: newObservationBucket[AlertObservation](), codeScanning: newObservationBucket[AlertObservation](),
 		secretScanning: newObservationBucket[AlertObservation](), membershipByOrg: map[string]membershipTally{},
+		featureSignals:              newObservationBucket[RepositoryFeatureSignal](),
 		securityConfigCoverageByOrg: map[string]MetricValue{}, installationsComplete: true,
 		directOrgRulesetsByOrg: map[string]int{}, directOrgRulesetsOrgSet: map[string]bool{}, defaultBranchRulesetActiveByOrg: map[string]bool{},
 		teamGrantedRepositoriesByOrg: map[string]map[string]bool{}, teamGrantCountByOrg: map[string]int{},
@@ -234,8 +235,14 @@ func (a *metricAccumulator) addReferences(references []ActionReference) {
 	a.references = append(a.references, references...)
 }
 
-func (a *metricAccumulator) addFeatureSignal(signal RepositoryFeatureSignal) {
-	a.featureSignals = append(a.featureSignals, signal)
+// addFeatureSignal folds one repository's CodeQL/Dependency eligibility and
+// operational signal into both the run-wide pooled bucket and its own
+// organization's bucket, so AggregateFeatureCoverage can be called once
+// over the full run (Overall) and once per organization (PerOrganization)
+// from the identical underlying signals -- never two divergent
+// computations for the same metric key.
+func (a *metricAccumulator) addFeatureSignal(organizationKey string, signal RepositoryFeatureSignal) {
+	a.featureSignals.add(organizationKey, []RepositoryFeatureSignal{signal}, true)
 }
 
 // addPullRequests folds one repository's sampled merged-PR activity into the
@@ -529,9 +536,20 @@ func (a *metricAccumulator) populate(metrics map[string]Metric, lookbackStart, l
 		Population: "analyzed workflow `uses:` references whose ref is a GitHub Actions expression and cannot be statically assessed for pin status",
 	})
 
-	codeQLCoverage, dependencyCoverage := AggregateFeatureCoverage(a.featureSignals)
+	codeQLCoverage, dependencyCoverage := AggregateFeatureCoverage(a.featureSignals.overall)
 	setMetric(metrics, codeQLCoverage.Feature, codeQLCoverage.Metric)
 	setMetric(metrics, dependencyCoverage.Feature, dependencyCoverage.Metric)
+	// Per-organization values are computed from that organization's own
+	// subset of signals, the identical cohort-sensitive AggregateFeatureCoverage
+	// mechanism -- an organization whose every repository's eligibility and
+	// operational status is confidently known reports its own true value
+	// here even when the pooled Overall above is unavailable because of an
+	// unresolved repository in a DIFFERENT organization.
+	for organizationKey, signals := range a.featureSignals.byOrganization {
+		orgCodeQL, orgDependency := AggregateFeatureCoverage(signals)
+		setMetricPerOrganization(metrics, codeQLCoverage.Feature, organizationKey, orgCodeQL.Metric)
+		setMetricPerOrganization(metrics, dependencyCoverage.Feature, organizationKey, orgDependency.Metric)
+	}
 
 	if err := a.populateActivityMetrics(metrics, lookbackStart, lookbackEnd); err != nil {
 		return err

@@ -37,19 +37,20 @@ func RunImplementedCollectorIDs() []string {
 // RepositoryRunResult is one analyzed repository's effective branch protection,
 // workflow analysis and feature-eligibility signal.
 type RepositoryRunResult struct {
-	FullName            string                               `json:"full_name"`
-	DefaultBranch       string                               `json:"default_branch"`
-	EffectiveProtection *EffectiveBranchProtection           `json:"effective_protection,omitempty"`
-	Workflows           *WorkflowAnalysisResult              `json:"workflows,omitempty"`
-	Feature             RepositoryFeatureSignal              `json:"feature"`
-	PullRequests        *RepositoryPullRequestResult         `json:"pull_requests,omitempty"`
-	ActionsRuns         *RepositoryActionsRunsResult         `json:"actions_runs,omitempty"`
-	Access              *RepositoryAccessResult              `json:"access,omitempty"`
-	ContentsProbe       *RepositoryContentsProbeResult       `json:"contents_probe,omitempty"`
-	CommitVerification  *RepositoryCommitVerificationResult  `json:"commit_verification,omitempty"`
-	SecretsEnv          *RepositorySecretsEnvResult          `json:"secrets_env,omitempty"`
-	Releases            *RepositoryReleasesResult            `json:"releases,omitempty"`
-	DiscussionsProjects *RepositoryDiscussionsProjectsResult `json:"discussions_projects,omitempty"`
+	FullName             string                                `json:"full_name"`
+	DefaultBranch        string                                `json:"default_branch"`
+	EffectiveProtection  *EffectiveBranchProtection            `json:"effective_protection,omitempty"`
+	Workflows            *WorkflowAnalysisResult               `json:"workflows,omitempty"`
+	Feature              RepositoryFeatureSignal               `json:"feature"`
+	PullRequests         *RepositoryPullRequestResult          `json:"pull_requests,omitempty"`
+	ActionsRuns          *RepositoryActionsRunsResult          `json:"actions_runs,omitempty"`
+	Access               *RepositoryAccessResult               `json:"access,omitempty"`
+	ContentsProbe        *RepositoryContentsProbeResult        `json:"contents_probe,omitempty"`
+	CommitVerification   *RepositoryCommitVerificationResult   `json:"commit_verification,omitempty"`
+	SecretsEnv           *RepositorySecretsEnvResult           `json:"secrets_env,omitempty"`
+	Releases             *RepositoryReleasesResult             `json:"releases,omitempty"`
+	DiscussionsProjects  *RepositoryDiscussionsProjectsResult  `json:"discussions_projects,omitempty"`
+	CodeScanningAnalyses *RepositoryCodeScanningAnalysesResult `json:"code_scanning_analyses,omitempty"`
 }
 
 // OrganizationOperationalResult bundles the Phase 4 organization-scoped
@@ -304,7 +305,7 @@ func runVerticalSliceWithStore(ctx context.Context, profile *Profile, config *Cu
 				owner, name := splitOwnerRepo(fullName)
 				repoScope := Scope{Host: target.Host, Kind: RepositoryScope, Name: fullName}
 				repoResult := analyzeOneRepository(ctx, client, graphQLClient, store, orgScope, repoScope, organization, owner, name, repo,
-					lookbackStart, report, accumulator)
+					lookbackStart, now, report, accumulator)
 				orgResult.Repositories = append(orgResult.Repositories, repoResult)
 			}
 			orgResult.Operational = analyzeOrganizationOperational(ctx, client, graphQLClient, store, orgScope, organization,
@@ -481,7 +482,7 @@ func analyzeOrganizationOperational(ctx context.Context, client, graphQLClient *
 // analysis for one repository and folds its contribution into the run-wide
 // metric accumulator.
 func analyzeOneRepository(ctx context.Context, client, graphQLClient *CollectionClient, store *EvidenceStore, orgScope, repoScope Scope,
-	organization, owner, name string, repo *github.Repository, lookbackStart time.Time,
+	organization, owner, name string, repo *github.Repository, lookbackStart, now time.Time,
 	report *VerticalSliceReport, accumulator *metricAccumulator) RepositoryRunResult {
 	details, detailsOutcome, detailsErr := FetchRepositoryDetails(ctx, client, store, repoScope, owner, name)
 	report.Outcomes = append(report.Outcomes, detailsOutcome)
@@ -509,17 +510,48 @@ func analyzeOneRepository(ctx context.Context, client, graphQLClient *Collection
 	if workflowErr == nil && workflows != nil {
 		result.Workflows = workflows
 		accumulator.addReferences(workflows.References)
-		result.Feature.CodeQLOperational = workflows.CodeQLOperational
+		// A workflow file referencing the github/codeql-action step is kept
+		// as a separate diagnostic-only signal, not folded into the
+		// authoritative CodeQLOperational determination below: the
+		// reference alone cannot prove the workflow has ever actually
+		// succeeded (a broken trigger, a failing step, a disabled
+		// workflow, or a schedule that has simply never fired all leave
+		// the reference in place without ever producing a genuine
+		// analysis).
+		result.Feature.CodeQLWorkflowReferenced = workflows.CodeQLOperational
 	}
 
 	// GitHub's native code-scanning default setup is a distinct enablement
-	// mechanism from a custom `github/codeql-action` workflow step; either one
-	// makes code scanning operationally active for this repository.
+	// signal, kept diagnostic-only (not folded into the authoritative
+	// CodeQLOperational determination below): "configured" means the
+	// feature is turned on, not that a scan has ever actually completed
+	// (a newly configured repository's first scheduled scan can still be
+	// pending).
 	defaultSetupConfigured, defaultSetupOutcome, _ := FetchRepositoryCodeScanningDefaultSetup(ctx, client, store, repoScope, owner, name)
 	report.Outcomes = append(report.Outcomes, defaultSetupOutcome)
-	if defaultSetupConfigured != nil && *defaultSetupConfigured {
-		result.Feature.CodeQLOperational = true
+	if defaultSetupConfigured != nil {
+		result.Feature.CodeQLDefaultSetupConfiguredKnown = true
+		result.Feature.CodeQLDefaultSetupConfigured = *defaultSetupConfigured
 	}
+	// The repository's own recorded analysis history, bound to its default
+	// branch and this run's [lookbackStart, now) window (now is the run's
+	// own frozen clock value, never a live time.Now() call, so a replayed
+	// run reproduces the identical window), is this package's ONLY
+	// authoritative CodeQLOperational signal -- real, observed, successful
+	// activity, never an enablement proxy.
+	codeScanningAnalyses, codeScanningAnalysesOutcome, _ := FetchRepositoryCodeScanningAnalyses(ctx, client, store, repoScope,
+		owner, name, defaultBranch, lookbackStart, now)
+	report.Outcomes = append(report.Outcomes, codeScanningAnalysesOutcome)
+	result.CodeScanningAnalyses = &codeScanningAnalyses
+	result.Feature.CodeQLOperational = codeScanningAnalyses.CodeQLAnalysisObserved
+	// Positive evidence overrides an otherwise-incomplete collection: if a
+	// genuine successful CodeQL entry was found despite some unrelated
+	// malformed entries elsewhere in the same page set, operational status
+	// is still confidently known true. Absent that, an incomplete
+	// collection (a concealed/failed probe, or malformed entries with no
+	// positive match) leaves operational status unknown, never a
+	// confident false.
+	result.Feature.CodeQLOperationalKnown = codeScanningAnalyses.Complete || codeScanningAnalyses.CodeQLAnalysisObserved
 
 	organizationKey := orgScope.Key()
 	pullRequests, pullRequestOutcomes, _ := FetchRepositoryPullRequests(ctx, client, store, repoScope, owner, name)
@@ -532,9 +564,18 @@ func analyzeOneRepository(ctx context.Context, client, graphQLClient *Collection
 	result.ActionsRuns = &actionsRuns
 	accumulator.addActionsRuns(organizationKey, actionsRuns)
 
-	languages, languagesOutcome, _ := FetchRepositoryLanguages(ctx, client, store, repoScope, owner, name)
+	// A concealed/failed languages probe (for example HTTP 403) leaves
+	// CodeQL eligibility unknown rather than a confident false: an empty
+	// map on failure would otherwise silently read as "no CodeQL-supported
+	// language present", excluding this repository from
+	// AggregateFeatureCoverage's denominator as if it had been genuinely
+	// checked and found ineligible.
+	languages, languagesOutcome, languagesErr := FetchRepositoryLanguages(ctx, client, store, repoScope, owner, name)
 	report.Outcomes = append(report.Outcomes, languagesOutcome)
-	result.Feature.CodeQLEligible = HasPositiveCodeQLSupportedLanguageBytes(languages)
+	if languagesErr == nil {
+		result.Feature.CodeQLEligibleKnown = true
+		result.Feature.CodeQLEligible = HasPositiveCodeQLSupportedLanguageBytes(languages)
+	}
 
 	// repo.contents_probe inventories actual dependency manifest files
 	// (recursive default-branch tree, falling back to root-only when
@@ -555,13 +596,31 @@ func analyzeOneRepository(ctx context.Context, client, graphQLClient *Collection
 	}
 	dependencyEligibility, eligibilityErr := DependencyEligibility(supportedManifests, dependencyPackages, true)
 	dependencyEligibilityKnown := eligibilityErr == nil && dependencyEligibility.Status == MetricKnown
+	result.Feature.DependencyEligibleKnown = dependencyEligibilityKnown
 	if dependencyEligibilityKnown {
 		result.Feature.DependencyEligible = dependencyEligibility.Boolean != nil && *dependencyEligibility.Boolean
 	}
+	// Dependabot security-updates enablement is only observed when the
+	// repository's own details (including security_and_analysis) were
+	// actually fetched; a failed/absent details fetch leaves operational
+	// status unknown, never a confident false, exactly mirroring
+	// CodeQLOperationalKnown's contract above. The documented status enum
+	// (https://docs.github.com/code-security/dependabot/dependabot-security-updates/about-dependabot-security-updates)
+	// is exactly "enabled"/"disabled"; an omitted or any other
+	// unrecognized status value leaves operational status unknown too --
+	// GetStatus() returning "" for an omitted field must never coerce into
+	// a confident known-disabled zero.
 	if result.Feature.DependencyEligible && detailsErr == nil && details != nil {
 		if analysis := details.GetSecurityAndAnalysis(); analysis != nil {
 			if updates := analysis.GetDependabotSecurityUpdates(); updates != nil {
-				result.Feature.DependencyOperational = updates.GetStatus() == "enabled"
+				switch updates.GetStatus() {
+				case "enabled":
+					result.Feature.DependencyOperationalKnown = true
+					result.Feature.DependencyOperational = true
+				case "disabled":
+					result.Feature.DependencyOperationalKnown = true
+					result.Feature.DependencyOperational = false
+				}
 			}
 		}
 	}
@@ -599,6 +658,6 @@ func analyzeOneRepository(ctx context.Context, client, graphQLClient *Collection
 		result.DiscussionsProjects = &discussionsProjects
 	}
 
-	accumulator.addFeatureSignal(result.Feature)
+	accumulator.addFeatureSignal(organizationKey, result.Feature)
 	return result
 }

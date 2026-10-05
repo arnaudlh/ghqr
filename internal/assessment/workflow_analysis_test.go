@@ -226,7 +226,8 @@ jobs:
 	_ = disabledCodeQLRef
 
 	codeQLCoverage, _ := AggregateFeatureCoverage([]RepositoryFeatureSignal{{
-		FullName: "fixture-org/widget", CodeQLEligible: true, CodeQLOperational: result.CodeQLOperational,
+		FullName: "fixture-org/widget", CodeQLEligible: true, CodeQLEligibleKnown: true,
+		CodeQLOperational: result.CodeQLOperational, CodeQLOperationalKnown: true,
 	}})
 	if codeQLCoverage.Numerator != 1 || codeQLCoverage.Denominator != 1 {
 		t.Fatalf("CodeQL coverage did not fold the disabled workflow out of the operational signal: %+v", codeQLCoverage)

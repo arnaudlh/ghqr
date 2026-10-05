@@ -30,11 +30,25 @@ milestones.
 
 Enterprise/GHES collectors are gated by explicit target configuration, platform
 and credentials; registration is not a claim of successful access. Partial
-features include code-scanning analyses/autofix, release-attestation digest
+features include code-scanning autofix, release-attestation digest
 verification and enterprise-wide security-configuration coverage. PRs use a
 last-100-merged sample and Actions runs a most-recent-1,000 cap; those metrics
 retain sampling caveats. Failed or missing peers cannot silently reduce a
 population into a clean percentage.
+
+CodeQL operational observations come from a successful analysis on the observed
+default branch within the configured collection window, not workflow-reference
+or default-setup enablement alone. Those two settings remain separate diagnostic
+signals. An analysis with a non-empty error cannot count as operational; a
+successful analysis with zero findings can. This window is an offering policy,
+not a universal GitHub framework mandate.
+
+CodeQL and dependency coverage retain independently known eligibility/operation
+states and observed numerators/denominators. Any unresolved peer that can change
+the cohort or outcome makes the pooled and affected organization metric
+unavailable with no numeric percentage, rather than a clean known subset ratio.
+A confidently measured organization remains measured even when another is
+unavailable.
 
 Audit logs use one paginated date-bounded stream with local action classification
 and event-ID deduplication. The authoritative numeric `@timestamp` is read, and
