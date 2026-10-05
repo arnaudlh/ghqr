@@ -66,6 +66,7 @@ type metricAccumulator struct {
 	activeOrganizationRulesets map[string]bool
 	references                 []ActionReference
 	featureSignals             observationBucket[RepositoryFeatureSignal]
+	attestationSignals         observationBucket[RepositoryAttestationSignal]
 
 	// Phase 4 operational/security/governance additions. Each bucket is
 	// populated by the run loop (vertical_slice.go) calling the matching
@@ -167,6 +168,7 @@ func newMetricAccumulator() *metricAccumulator {
 		dependabot: newObservationBucket[AlertObservation](), codeScanning: newObservationBucket[AlertObservation](),
 		secretScanning: newObservationBucket[AlertObservation](), membershipByOrg: map[string]membershipTally{},
 		featureSignals:              newObservationBucket[RepositoryFeatureSignal](),
+		attestationSignals:          newObservationBucket[RepositoryAttestationSignal](),
 		securityConfigCoverageByOrg: map[string]MetricValue{}, installationsComplete: true,
 		directOrgRulesetsByOrg: map[string]int{}, directOrgRulesetsOrgSet: map[string]bool{}, defaultBranchRulesetActiveByOrg: map[string]bool{},
 		teamGrantedRepositoriesByOrg: map[string]map[string]bool{}, teamGrantCountByOrg: map[string]int{},
@@ -243,6 +245,14 @@ func (a *metricAccumulator) addReferences(references []ActionReference) {
 // computations for the same metric key.
 func (a *metricAccumulator) addFeatureSignal(organizationKey string, signal RepositoryFeatureSignal) {
 	a.featureSignals.add(organizationKey, []RepositoryFeatureSignal{signal}, true)
+}
+
+// addAttestationSignal folds one repository's critical_repos_with_attestations_pct
+// pooling signal into both the run-wide pooled bucket and its own
+// organization's bucket, mirroring addFeatureSignal's identical
+// Overall/PerOrganization pattern.
+func (a *metricAccumulator) addAttestationSignal(organizationKey string, signal RepositoryAttestationSignal) {
+	a.attestationSignals.add(organizationKey, []RepositoryAttestationSignal{signal}, true)
 }
 
 // addPullRequests folds one repository's sampled merged-PR activity into the
@@ -549,6 +559,13 @@ func (a *metricAccumulator) populate(metrics map[string]Metric, lookbackStart, l
 		orgCodeQL, orgDependency := AggregateFeatureCoverage(signals)
 		setMetricPerOrganization(metrics, codeQLCoverage.Feature, organizationKey, orgCodeQL.Metric)
 		setMetricPerOrganization(metrics, dependencyCoverage.Feature, organizationKey, orgDependency.Metric)
+	}
+
+	attestationCoverage := AggregateAttestationCoverage(a.attestationSignals.overall)
+	setMetric(metrics, attestationCoverage.Feature, attestationCoverage.Metric)
+	for organizationKey, signals := range a.attestationSignals.byOrganization {
+		orgAttestation := AggregateAttestationCoverage(signals)
+		setMetricPerOrganization(metrics, attestationCoverage.Feature, organizationKey, orgAttestation.Metric)
 	}
 
 	if err := a.populateActivityMetrics(metrics, lookbackStart, lookbackEnd); err != nil {

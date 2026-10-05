@@ -310,12 +310,11 @@ func FetchRepositorySecretsAndEnvironments(ctx context.Context, client *Collecti
 }
 
 // RepositoryReleasesResult reports the repository's actual release
-// inventory (releases_count) from repo.releases_packages. Attestation
-// verification (critical_repos_with_attestations_pct,
-// deploy_workflows_verifying_pct) requires resolving a release asset or
-// container image digest and probing GET .../attestations/{subject_digest},
-// which this collector does not attempt this round — recorded as a
-// remaining gap, not a fabricated pass/fail.
+// inventory (releases_count) from repo.releases_packages.
+// critical_repos_with_attestations_pct (see
+// FetchRepositoryAttestationCoverage) collects its own latest-release
+// lookup separately, since the two features have different pagination and
+// "latest" semantics.
 type RepositoryReleasesResult struct {
 	ReleasesCount    int  `json:"releases_count"`
 	PrereleasesCount int  `json:"prereleases_count"`

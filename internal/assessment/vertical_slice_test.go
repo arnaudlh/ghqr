@@ -6,6 +6,7 @@ package assessment
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -735,6 +736,169 @@ func TestRunVerticalSliceDependabotSecurityUpdatesExplicitDisabledIsKnownZero(t 
 	}
 	if dependency.Overall.Status != MetricKnown || dependency.Overall.Number == nil || *dependency.Overall.Number != 0 {
 		t.Fatalf("an explicit disabled status must remain a confident known 0%%, not forced unavailable: %+v", dependency.Overall)
+	}
+}
+
+// TestRunVerticalSliceCriticalRepoAttestationScopingIsNotInflatedByNonCritical
+// is a full run-loop fixture proving critical_repos_with_attestations_pct's
+// documented scope end to end: an explicit org.properties-based critical
+// determination marks exactly one of two repositories critical; only that
+// repository's latest-release asset attestation is ever probed (the
+// non-critical repository's attestations endpoint is never requested at
+// all -- asserted directly, not merely inferred from a 404 catch-all). The
+// one served attestation bundle is a deliberately empty/malformed Sigstore
+// bundle object -- proving a structurally invalid bundle never fabricates a
+// verified/complete result (the same semantics as
+// TestFetchRepositoryAttestationCoverageMalformedBundleIsNotComplete's
+// focused unit test, exercised here through the full run loop), and that
+// this is reported as an unresolved (MetricUnavailable) pooled result --
+// never a false confident 0%, and never diluted/inflated by the
+// non-critical peer. The library's full cryptographic policy
+// (identity, digest, chain, transparency-log/authenticated-time) is
+// exercised directly against real Sigstore-signed material by
+// TestVerifyAttestationBundleAcceptsGenuineHistoricalProvenance and its
+// sibling negative-policy tests in attestation_verification_test.go, not
+// re-derived here.
+func TestRunVerticalSliceCriticalRepoAttestationScopingIsNotInflatedByNonCritical(t *testing.T) {
+	now := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	assetDigest := "sha256:a1b2c3d4e5f600000000000000000000000000000000000000000000000000"
+	malformedBundle := []byte(`{}`)
+	repos := []map[string]any{
+		{
+			"name": "repo-001", "full_name": "fixture-org/repo-001", "visibility": "public", "private": false,
+			"archived": false, "fork": false, "default_branch": "main", "language": "Go",
+			"pushed_at": now.AddDate(0, 0, -5).Format(time.RFC3339), "created_at": now.AddDate(-2, 0, 0).Format(time.RFC3339),
+		},
+		{
+			"name": "repo-002", "full_name": "fixture-org/repo-002", "visibility": "public", "private": false,
+			"archived": false, "fork": false, "default_branch": "main", "language": "Go",
+			"pushed_at": now.AddDate(0, 0, -5).Format(time.RFC3339), "created_at": now.AddDate(-2, 0, 0).Format(time.RFC3339),
+		},
+	}
+	nonCriticalAttestationEndpointRequested := false
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		path := request.URL.Path
+		switch {
+		case path == "/orgs/fixture-org":
+			writeJSON(t, writer, map[string]any{"login": "fixture-org", "two_factor_requirement_enabled": true})
+		case path == "/orgs/fixture-org/repos":
+			writeJSON(t, writer, repos)
+		case path == "/orgs/fixture-org/properties/schema":
+			writeJSON(t, writer, []map[string]any{{"property_name": "tier"}})
+		case path == "/orgs/fixture-org/properties/values":
+			writeJSON(t, writer, []map[string]any{
+				{"repository_id": 1, "repository_name": "repo-001", "repository_full_name": "fixture-org/repo-001",
+					"properties": []map[string]any{{"property_name": "tier", "value": "sev1"}}},
+				{"repository_id": 2, "repository_name": "repo-002", "repository_full_name": "fixture-org/repo-002",
+					"properties": []map[string]any{{"property_name": "tier", "value": "sev3"}}},
+			})
+		case strings.HasSuffix(path, "/rules/branches/main"), strings.HasSuffix(path, "/rulesets"):
+			writeJSON(t, writer, []map[string]any{})
+		case strings.HasSuffix(path, "/branches/main/protection"):
+			writer.WriteHeader(http.StatusNotFound)
+			writeJSON(t, writer, map[string]string{"message": "Branch not protected"})
+		case strings.HasSuffix(path, "/actions/workflows"):
+			writeJSON(t, writer, map[string]any{"total_count": 0, "workflows": []map[string]any{}})
+		case strings.HasSuffix(path, "/languages"):
+			writeJSON(t, writer, map[string]any{"Go": 12345})
+		case strings.HasSuffix(path, "/code-scanning/default-setup"):
+			writeJSON(t, writer, map[string]any{"state": "not-configured"})
+		case strings.HasSuffix(path, "/code-scanning/analyses"):
+			writeJSON(t, writer, []map[string]any{})
+		case strings.HasSuffix(path, "/dependency-graph/sbom"):
+			writer.WriteHeader(http.StatusNotFound)
+			writeJSON(t, writer, map[string]string{"message": "dependency graph is not enabled"})
+		case path == "/repos/fixture-org/repo-001/releases":
+			writeJSON(t, writer, []map[string]any{
+				{"id": 1, "tag_name": "v1.0.0", "draft": false, "prerelease": false, "created_at": now.AddDate(0, 0, -1).Format(time.RFC3339),
+					"assets": []map[string]any{{"id": 1, "name": "widget.tar.gz", "digest": assetDigest}}},
+			})
+		case path == "/repos/fixture-org/repo-001/releases/latest":
+			writeJSON(t, writer, map[string]any{
+				"id": 1, "tag_name": "v1.0.0", "draft": false, "prerelease": false, "created_at": now.AddDate(0, 0, -1).Format(time.RFC3339),
+				"assets": []map[string]any{{"id": 1, "name": "widget.tar.gz", "digest": assetDigest}},
+			})
+		case path == "/repos/fixture-org/repo-001/attestations/"+assetDigest:
+			writeJSON(t, writer, map[string]any{
+				"attestations": []map[string]any{{"bundle": json.RawMessage(malformedBundle), "repository_id": 1}},
+			})
+		case path == "/repos/fixture-org/repo-002/releases":
+			writeJSON(t, writer, []map[string]any{})
+		case path == "/repos/fixture-org/repo-002/releases/latest":
+			writer.WriteHeader(http.StatusNotFound)
+			writeJSON(t, writer, map[string]string{"message": "Not Found"})
+		case strings.HasPrefix(path, "/repos/fixture-org/repo-002/attestations/"):
+			nonCriticalAttestationEndpointRequested = true
+			writer.WriteHeader(http.StatusNotFound)
+		case strings.HasPrefix(path, "/repos/fixture-org/repo-") && strings.Count(path, "/") == 3:
+			name := strings.TrimPrefix(path, "/repos/fixture-org/")
+			for _, repo := range repos {
+				if repo["name"] == name {
+					writeJSON(t, writer, repo)
+					return
+				}
+			}
+			writer.WriteHeader(http.StatusNotFound)
+		default:
+			writer.WriteHeader(http.StatusNotFound)
+			writeJSON(t, writer, map[string]string{"message": "not found"})
+		}
+	}))
+	t.Cleanup(server.Close)
+	clock := &fixtureClock{now: now}
+	client := collectionFixtureClient(t, server, fixtureBudget(t), clock)
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	target := Target{Host: client.base.Hostname(), Deployment: Cloud, Organizations: []string{"fixture-org"}}
+	config, err := ParseConfig([]byte("organizations: [fixture-org]\nrepository_cap: 10\ncritical_property: tier\ncritical_values: [sev1]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := runVerticalSliceWithStore(context.Background(), client.profile, config, []Target{target}, store, clock,
+		func(Target, EvidenceSource) (*CollectionClient, error) { return client, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nonCriticalAttestationEndpointRequested {
+		t.Fatal("the non-critical repository's attestations endpoint must never be requested at all")
+	}
+	byName := map[string]RepositoryRunResult{}
+	for _, repo := range report.Organizations[0].Repositories {
+		byName[repo.FullName] = repo
+	}
+	critical := byName["fixture-org/repo-001"]
+	if critical.AttestationCoverage == nil {
+		t.Fatal("expected the critical repository's attestation-coverage probe to have run at all")
+	}
+	if critical.AttestationCoverage.Complete || critical.AttestationCoverage.AnyVerified {
+		t.Fatalf("a malformed bundle must never be reported complete or verified: %+v", critical.AttestationCoverage)
+	}
+	if len(critical.AttestationCoverage.Assets) != 1 || critical.AttestationCoverage.Assets[0].Complete {
+		t.Fatalf("expected exactly one asset, itself reported incomplete because its only attestation entry is malformed: %+v",
+			critical.AttestationCoverage)
+	}
+	nonCritical := byName["fixture-org/repo-002"]
+	if nonCritical.AttestationCoverage != nil {
+		t.Fatalf("expected the non-critical repository to have no attestation coverage probe attempted at all: %+v", nonCritical.AttestationCoverage)
+	}
+
+	attestation, ok := report.Metrics["critical_repos_with_attestations_pct"]
+	if !ok {
+		t.Fatal("expected critical_repos_with_attestations_pct to be reported")
+	}
+	// The one critical repository's attestation status is itself unknown
+	// (its only attestation entry is malformed), so the pooled metric must
+	// stay MetricUnavailable/Number:nil -- a malformed bundle is never
+	// collapsed into a confident 0%, matching every other unknown-cohort
+	// gate this package already applies (see cohortCoverageMetric). The
+	// retained Denominator still confirms scoping to exactly the one
+	// critical repository, never the full two-repository population.
+	if attestation.Overall.Status != MetricUnavailable || attestation.Overall.Number != nil {
+		t.Fatalf("expected the malformed bundle to keep this metric unavailable, never a confident value: %+v", attestation.Overall)
+	}
+	if attestation.Overall.Denominator == nil || *attestation.Overall.Denominator != 1 {
+		t.Fatalf("expected the denominator scoped to exactly the one critical repository, never the full "+
+			"two-repository population: %+v", attestation.Overall)
 	}
 }
 

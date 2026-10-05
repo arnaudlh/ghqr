@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/go-github/v83/github"
+	"github.com/sigstore/sigstore-go/pkg/root"
 )
 
 // RunImplementedCollectorIDs lists the collector catalogue IDs this vertical
@@ -51,6 +52,7 @@ type RepositoryRunResult struct {
 	Releases             *RepositoryReleasesResult             `json:"releases,omitempty"`
 	DiscussionsProjects  *RepositoryDiscussionsProjectsResult  `json:"discussions_projects,omitempty"`
 	CodeScanningAnalyses *RepositoryCodeScanningAnalysesResult `json:"code_scanning_analyses,omitempty"`
+	AttestationCoverage  *RepositoryAttestationCoverageResult  `json:"attestation_coverage,omitempty"`
 }
 
 // OrganizationOperationalResult bundles the Phase 4 organization-scoped
@@ -179,6 +181,22 @@ func runVerticalSliceWithStore(ctx context.Context, profile *Profile, config *Cu
 	now := clock.Now()
 	lookbackStart := now.AddDate(0, 0, -config.LookbackDays)
 	alertWindowStart := now.AddDate(0, 0, -alertLifecycleWindowDays)
+	// Computed once per run (a pure function parsing an embedded resource,
+	// so a replayed run reproduces identical verification results from the
+	// same stored evidence bundle bytes -- no live network/TUF fetch, no
+	// asymmetry risk). A failure here is a programming error in this
+	// package's embedded resource, never a runtime condition; it leaves
+	// trustedMaterial nil, which verifyAttestationBundle's own documented
+	// contract already treats as "certificate chain trust can never be
+	// established" (every asset reported Complete:false, never a
+	// fabricated confident 0), not a crash or a silent fabricated pass.
+	trustedMaterial, trustedMaterialErr := DefaultSigstoreTrustedRoot()
+	if trustedMaterialErr != nil {
+		trustedMaterial = nil
+		report.Caveats = append(report.Caveats, fmt.Sprintf(
+			"embedded Sigstore trust root could not be parsed (%s); release asset attestation coverage will report "+
+				"Complete:false for this entire run", trustedMaterialErr))
+	}
 
 	for _, target := range targets {
 		client, err := newClient(target, RESTEvidence)
@@ -298,6 +316,17 @@ func runVerticalSliceWithStore(ctx context.Context, profile *Profile, config *Cu
 			// depends on (an unresolved critical population makes the whole
 			// organization's contribution unknown, never silently zero).
 			accumulator.setCriticalPopulation(orgScope.Key(), population.Critical)
+			// critical_repos_with_attestations_pct is scoped exclusively to
+			// this same confirmed critical population; reusing
+			// setCriticalPopulation's own already-computed known/FullNames
+			// (rather than re-deriving from population.Critical directly
+			// here) keeps the "unresolved" contract -- including the
+			// Method=="unknown" case, which is a non-nil result with an
+			// explanatory Reason, not a genuine determination -- identical
+			// to GOV-072's own established definition, not a second,
+			// potentially-divergent one.
+			criticalKnown := accumulator.criticalPopulationKnownByOrg[orgScope.Key()]
+			criticalFullNames := accumulator.criticalFullNamesByOrg[orgScope.Key()]
 
 			orgResult := OrganizationRunResult{Scope: orgScope, Population: population, Repositories: []RepositoryRunResult{}}
 			for _, repo := range eligible {
@@ -305,7 +334,7 @@ func runVerticalSliceWithStore(ctx context.Context, profile *Profile, config *Cu
 				owner, name := splitOwnerRepo(fullName)
 				repoScope := Scope{Host: target.Host, Kind: RepositoryScope, Name: fullName}
 				repoResult := analyzeOneRepository(ctx, client, graphQLClient, store, orgScope, repoScope, organization, owner, name, repo,
-					lookbackStart, now, report, accumulator)
+					lookbackStart, now, criticalKnown, criticalFullNames[fullName], trustedMaterial, report, accumulator)
 				orgResult.Repositories = append(orgResult.Repositories, repoResult)
 			}
 			orgResult.Operational = analyzeOrganizationOperational(ctx, client, graphQLClient, store, orgScope, organization,
@@ -483,6 +512,7 @@ func analyzeOrganizationOperational(ctx context.Context, client, graphQLClient *
 // metric accumulator.
 func analyzeOneRepository(ctx context.Context, client, graphQLClient *CollectionClient, store *EvidenceStore, orgScope, repoScope Scope,
 	organization, owner, name string, repo *github.Repository, lookbackStart, now time.Time,
+	criticalPopulationKnown, isCriticalRepository bool, attestationTrustedMaterial root.TrustedMaterial,
 	report *VerticalSliceReport, accumulator *metricAccumulator) RepositoryRunResult {
 	details, detailsOutcome, detailsErr := FetchRepositoryDetails(ctx, client, store, repoScope, owner, name)
 	report.Outcomes = append(report.Outcomes, detailsOutcome)
@@ -651,6 +681,23 @@ func analyzeOneRepository(ctx context.Context, client, graphQLClient *Collection
 	releases, releasesOutcome, _ := FetchRepositoryReleases(ctx, client, store, repoScope, owner, name)
 	report.Outcomes = append(report.Outcomes, releasesOutcome)
 	result.Releases = &releases
+
+	// critical_repos_with_attestations_pct is scoped exclusively to the
+	// organization's confirmed critical population: the attestation-
+	// coverage probe (a latest-release lookup plus a per-asset attestation
+	// lookup) is never even attempted for a repository that is not a
+	// confirmed critical-population member, matching this metric's
+	// documented scope and avoiding uncounted-for API cost on the
+	// repository population at large.
+	attestationSignal := RepositoryAttestationSignal{FullName: repo.GetFullName(), CriticalKnown: criticalPopulationKnown, Critical: isCriticalRepository}
+	if criticalPopulationKnown && isCriticalRepository {
+		coverage, coverageOutcomes, _ := FetchRepositoryAttestationCoverage(ctx, client, store, repoScope, owner, name, attestationTrustedMaterial)
+		report.Outcomes = append(report.Outcomes, coverageOutcomes...)
+		result.AttestationCoverage = &coverage
+		attestationSignal.AttestationVerifiedKnown = coverage.Complete
+		attestationSignal.AttestationVerified = coverage.AnyVerified
+	}
+	accumulator.addAttestationSignal(organizationKey, attestationSignal)
 
 	discussionsProjects, discussionsProjectsOutcome, discussionsProjectsErr := FetchRepositoryDiscussionsProjects(ctx, graphQLClient, store, repoScope, owner, name)
 	report.Outcomes = append(report.Outcomes, discussionsProjectsOutcome)

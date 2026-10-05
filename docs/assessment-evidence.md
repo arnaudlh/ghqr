@@ -30,8 +30,8 @@ milestones.
 
 Enterprise/GHES collectors are gated by explicit target configuration, platform
 and credentials; registration is not a claim of successful access. Partial
-features include code-scanning autofix, release-attestation digest
-verification and enterprise-wide security-configuration coverage. PRs use a
+features include code-scanning autofix and enterprise-wide
+security-configuration coverage. PRs use a
 last-100-merged sample and Actions runs a most-recent-1,000 cap; those metrics
 retain sampling caveats. Failed or missing peers cannot silently reduce a
 population into a clean percentage.
@@ -49,6 +49,24 @@ the cohort or outcome makes the pooled and affected organization metric
 unavailable with no numeric percentage, rather than a clean known subset ratio.
 A confidently measured organization remains measured even when another is
 unavailable.
+
+Attestation coverage is restricted to confirmed critical repositories and the
+assets of their latest published release. It uses the release asset's typed
+digest without downloading artifact contents or following signed URLs.
+Maintained `sigstore-go` verification checks repository-bound GitHub Actions
+OIDC identity, artifact digest, recognized build-provenance predicate, trusted
+certificate material, SCT/log inclusion and authenticated signing-time evidence.
+A digest match alone is diagnostic, not verified provenance. Historical
+short-lived certificates are checked at authenticated time, not replay wall
+clock.
+
+Trust material is a versioned, embedded public-good Sigstore snapshot, not
+automatically refreshed through TUF during collection/replay. New trust roots
+require a reviewed snapshot update. Missing digests, malformed/omitted arrays,
+concealed 404s and insufficient trust evidence remain unknown, with explicit
+outcome reasons. Attestation pages use digest-qualified identities so multiple
+assets cannot overwrite each other's evidence. Unresolved critical membership
+or verification peers make pooled/affected-org percentages unavailable.
 
 Audit logs use one paginated date-bounded stream with local action classification
 and event-ID deduplication. The authoritative numeric `@timestamp` is read, and
