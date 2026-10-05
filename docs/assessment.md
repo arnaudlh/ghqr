@@ -126,10 +126,21 @@ be scoped explicitly without authorizing discovery of every organization.
 
 Missing evidence is `NOT_ASSESSED`, never false, zero, clean or implemented.
 Metrics distinguish known numeric/boolean/text values from unavailable data;
+string-list and numeric-dictionary payloads retain their JSON array/object shapes
+(including the profile's `friction_flags` and `rule_type_coverage`). A known
+metric has exactly one typed payload; unavailable/inapplicable metrics have none.
 ratio metrics preserve their numerator, denominator and population. A zero
 denominator is unavailable, not zero percent or full coverage. Per-organization
 keys include the GitHub host. Collection readiness, runtime availability and
 collection completeness have separate types.
+
+`open_alerts_trend_90d_pct` is signed relative change:
+`(current_backlog - baseline_backlog) / baseline_backlog * 100`. Reductions are
+negative (down to -100), increases can exceed 100, and a zero baseline is
+unavailable rather than an invented 0% change. Baseline and current observations
+are retained. Its thresholds permit finite values >= -100; ordinary coverage
+percentage thresholds remain 0..100. Window consistency and lifecycle collection
+are requirements for the later alert collector, not capabilities claimed here.
 
 `N/A` is proposed only for a control's deployment scope excluded by the explicit
 targets. It must not be inferred from a 404, which can conceal authorization.

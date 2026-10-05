@@ -186,8 +186,17 @@ func (c *CustomerConfig) Validate() error {
 		return fmt.Errorf("invalid production environment expression: %w", err)
 	}
 	for key, threshold := range c.Thresholds {
-		if !metricKeyPattern.MatchString(key) || threshold < 0 || math.IsNaN(threshold) || math.IsInf(threshold, 0) {
-			return fmt.Errorf("threshold %q requires a valid metric key and a finite nonnegative value", key)
+		if !metricKeyPattern.MatchString(key) || math.IsNaN(threshold) || math.IsInf(threshold, 0) {
+			return fmt.Errorf("threshold %q requires a valid metric key and a finite value", key)
+		}
+		if key == "open_alerts_trend_90d_pct" {
+			if threshold < -100 {
+				return fmt.Errorf("signed change threshold %q must be at least -100", key)
+			}
+			continue
+		}
+		if threshold < 0 {
+			return fmt.Errorf("threshold %q requires a nonnegative value", key)
 		}
 		if strings.HasSuffix(key, "_pct") && threshold > 100 {
 			return fmt.Errorf("percentage threshold %q must not exceed 100", key)

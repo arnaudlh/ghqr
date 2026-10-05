@@ -146,20 +146,36 @@ const (
 
 // MetricValue is a typed, nullable value with its population and provenance.
 type MetricValue struct {
-	Status       MetricStatus `json:"status"`
-	Number       *float64     `json:"number,omitempty"`
-	Boolean      *bool        `json:"boolean,omitempty"`
-	Text         *string      `json:"text,omitempty"`
-	Numerator    *float64     `json:"numerator,omitempty"`
-	Denominator  *float64     `json:"denominator,omitempty"`
-	Population   string       `json:"population"`
-	Sampled      bool         `json:"sampled"`
-	EvidenceRefs []string     `json:"evidence_refs"`
-	Reason       string       `json:"reason,omitempty"`
+	Status       MetricStatus        `json:"status"`
+	Number       *float64            `json:"number,omitempty"`
+	Boolean      *bool               `json:"boolean,omitempty"`
+	Text         *string             `json:"text,omitempty"`
+	List         *[]string           `json:"list,omitempty"`
+	Dictionary   *map[string]float64 `json:"dictionary,omitempty"`
+	Numerator    *float64            `json:"numerator,omitempty"`
+	Denominator  *float64            `json:"denominator,omitempty"`
+	Baseline     *float64            `json:"baseline,omitempty"`
+	Current      *float64            `json:"current,omitempty"`
+	Population   string              `json:"population"`
+	Sampled      bool                `json:"sampled"`
+	EvidenceRefs []string            `json:"evidence_refs"`
+	Reason       string              `json:"reason,omitempty"`
 }
 
 // Validate rejects unknown values disguised as false or zero.
 func (v MetricValue) Validate() error {
+	if (v.Baseline == nil) != (v.Current == nil) {
+		return fmt.Errorf("signed change metrics require both baseline and current observations")
+	}
+	if v.Baseline != nil {
+		if math.IsNaN(*v.Baseline) || math.IsNaN(*v.Current) ||
+			math.IsInf(*v.Baseline, 0) || math.IsInf(*v.Current, 0) || *v.Baseline < 0 || *v.Current < 0 {
+			return fmt.Errorf("signed change observations must be finite and nonnegative")
+		}
+		if v.Numerator != nil || v.Denominator != nil {
+			return fmt.Errorf("signed change and coverage ratio populations cannot be combined")
+		}
+	}
 	if (v.Numerator == nil) != (v.Denominator == nil) {
 		return fmt.Errorf("ratio metrics require both numerator and denominator")
 	}
@@ -183,6 +199,23 @@ func (v MetricValue) Validate() error {
 	if v.Text != nil {
 		values++
 	}
+	if v.List != nil {
+		values++
+		if *v.List == nil {
+			return fmt.Errorf("known list payload must be an array, not null")
+		}
+	}
+	if v.Dictionary != nil {
+		values++
+		if *v.Dictionary == nil {
+			return fmt.Errorf("known dictionary payload must be an object, not null")
+		}
+		for key, number := range *v.Dictionary {
+			if key == "" || math.IsNaN(number) || math.IsInf(number, 0) {
+				return fmt.Errorf("dictionary entries require nonempty keys and finite numbers")
+			}
+		}
+	}
 	switch v.Status {
 	case MetricKnown:
 		if values != 1 {
@@ -193,6 +226,9 @@ func (v MetricValue) Validate() error {
 		}
 		if v.Numerator != nil && v.Number == nil {
 			return fmt.Errorf("known ratio metric requires a numeric value")
+		}
+		if v.Baseline != nil && (*v.Baseline == 0 || v.Number == nil) {
+			return fmt.Errorf("known signed change requires a positive baseline and numeric value")
 		}
 	case MetricUnavailable, MetricInapplicable:
 		if values != 0 || v.Reason == "" {
@@ -219,6 +255,7 @@ func Percentage(numerator, denominator float64, population string) (MetricValue,
 		value.Reason = "population has zero eligible observations"
 		return value, nil
 	}
+
 	percentage := numerator / denominator * 100
 	value.Status = MetricKnown
 	value.Number = &percentage

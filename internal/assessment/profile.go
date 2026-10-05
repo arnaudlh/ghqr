@@ -362,11 +362,15 @@ func (p *Profile) Summary() ProfileSummary {
 
 // Sources preserves origin mapping and known reconciliation exceptions without expanding the catalogue.
 func (p *Profile) Sources() []SourceReference {
+	checklists := map[string]string{
+		"Productivity": "productivity", "Collaboration": "collaboration",
+		"Application Security": "application-security", "Governance": "governance", "Architecture": "architecture",
+	}
 	references := make([]SourceReference, 0, len(p.Controls))
 	for _, control := range p.Controls {
 		ref := SourceReference{
 			ControlID: control.ID, Origin: control.Origin, ProfileVersion: p.Version,
-			ProfileSHA256: p.SHA256, AuthorityURL: FrameworkURL,
+			ProfileSHA256: p.SHA256, AuthorityURL: FrameworkURL + "/" + checklists[control.Pillar] + "/checklist",
 			MappingNote: "framework-derived profile wording; not a claim of live exact wording parity",
 		}
 		if control.Origin == SecurityDeepDive {
