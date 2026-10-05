@@ -41,6 +41,16 @@ func TestCustomerConfig(t *testing.T) {
 		{"duplicate organizations", "organizations: [Acme, acme]", "duplicate organization"},
 		{"unknown option", "organizations: [acme]\nunknown: true", "decode customer configuration"},
 		{"multiple documents", "organizations: [acme]\n---\norganizations: [other]", "exactly one YAML"},
+		{"scim_mode invalid value", "organizations: [acme]\nscim_mode: bogus", "scim_mode must be empty"},
+		{"scim_mode emu requires enterprise", "organizations: [acme]\nscim_mode: emu", "requires an explicit enterprise"},
+		{"scim_mode emu requires cloud deployment", "deployment: ghes\nghes_host: github.example.com\norganizations: [acme]\nenterprise: acme\nscim_mode: emu",
+			"requires a cloud deployment"},
+		{"scim_mode saml_sso requires cloud deployment", "deployment: ghes\nghes_host: github.example.com\norganizations: [acme]\nscim_mode: saml_sso",
+			"requires a cloud deployment"},
+		{"scim_mode ghes requires server deployment", "organizations: [acme]\nscim_mode: ghes", "requires a server deployment"},
+		{"scim_mode emu valid for cloud enterprise", "enterprise: acme\norganizations: [acme]\nscim_mode: emu", ""},
+		{"scim_mode saml_sso valid for cloud", "organizations: [acme]\nscim_mode: saml_sso", ""},
+		{"scim_mode ghes valid for server", "deployment: ghes\nghes_host: github.example.com\norganizations: [acme]\nscim_mode: ghes", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -88,6 +98,53 @@ targets:
 	second := (Scope{targets[1].Host, OrganizationScope, "acme"}).Key()
 	if first == second || first != "github.com/organization/acme" || second != "github.example.com/organization/acme" {
 		t.Fatalf("host-qualified scopes collide: %s %s", first, second)
+	}
+}
+
+// TestMixedHostExplicitSCIMModeRouting confirms each host in an explicit
+// multi-target configuration can independently declare the SCIM routing
+// mode valid for its own deployment (Cloud's "emu" alongside Server's
+// "ghes" in the same configuration), and that a target's mode can never be
+// silently inferred from, or applied across, another host's deployment.
+func TestMixedHostExplicitSCIMModeRouting(t *testing.T) {
+	config, err := ParseConfig([]byte(`
+targets:
+  - host: github.com
+    deployment: ghec
+    enterprise: acme-enterprise
+    organizations: [acme]
+    credentials: {kind: app-installation, token_env: CLOUD_APP_TOKEN}
+    scim_mode: emu
+  - host: github.example.com
+    deployment: ghes
+    organizations: [acme]
+    credentials:
+      kind: classic-pat
+      token_env: SERVER_API_TOKEN
+    scim_mode: ghes
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets, err := config.ResolvedTargets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if targets[0].SCIMMode != "emu" || targets[1].SCIMMode != "ghes" {
+		t.Fatalf("each host must retain its own explicitly configured SCIM routing mode, never a shared or inferred one: %+v", targets)
+	}
+	// Swapping the mode/deployment pairing must be rejected explicitly, not
+	// silently accepted or guessed into the correct one.
+	if _, err := ParseConfig([]byte(`
+targets:
+  - host: github.com
+    deployment: ghec
+    enterprise: acme
+    organizations: [acme]
+    credentials: {kind: app-installation, token_env: CLOUD_APP_TOKEN}
+    scim_mode: ghes
+`)); err == nil {
+		t.Fatal("scim_mode ghes on a cloud-deployed target must be rejected, not silently accepted")
 	}
 }
 

@@ -30,6 +30,7 @@ func RunImplementedCollectorIDs() []string {
 	// including ent.info/ghes.manage_api (gated by target Enterprise/Deployment).
 	ids = append(ids, EnterpriseCollectorIDs()...)
 	ids = append(ids, AuditCollectorIDs()...)
+	ids = append(ids, RemainingCollectorIDs()...)
 	return ids
 }
 
@@ -77,6 +78,8 @@ type OrganizationOperationalResult struct {
 	SecretScanningSettings     *OrgSecretScanningSettingsResult `json:"secret_scanning_settings,omitempty"`
 	BypassRequests             *OrgBypassRequestsResult         `json:"bypass_requests,omitempty"`
 	Campaigns                  *OrgCampaignsResult              `json:"campaigns,omitempty"`
+	APIInsights                *OrgAPIInsightsResult            `json:"api_insights,omitempty"`
+	Billing                    *BillingUsageResult              `json:"billing,omitempty"`
 }
 
 // TargetOperationalResult is one host target's enterprise-/instance-scoped
@@ -91,6 +94,10 @@ type TargetOperationalResult struct {
 	EnterpriseCodeSecurityConfigs *EnterpriseCodeSecurityConfigsResult `json:"enterprise_code_security_configs,omitempty"`
 	EnterpriseAuditLog            *AuditLogResult                      `json:"enterprise_audit_log,omitempty"`
 	EnterpriseAuditLogStreams     *EnterpriseAuditLogStreamsResult     `json:"enterprise_audit_log_streams,omitempty"`
+	EnterpriseBilling             *BillingUsageResult                  `json:"enterprise_billing,omitempty"`
+	EnterpriseCopilot             *EnterpriseCopilotResult             `json:"enterprise_copilot,omitempty"`
+	EnterprisePolicies            *EnterprisePoliciesResult            `json:"enterprise_policies,omitempty"`
+	EnterpriseSCIMUsers           *EnterpriseSCIMUsersResult           `json:"enterprise_scim_users,omitempty"`
 }
 
 // OrganizationRunResult is one organization scope's population and
@@ -194,6 +201,9 @@ func runVerticalSliceWithStore(ctx context.Context, profile *Profile, config *Cu
 				if infoErr == nil {
 					targetResult.EnterpriseInfo = info
 				}
+				policies, policiesOutcome, _ := FetchEnterprisePolicies(ctx, graphQLClient, store, entScope, target.Enterprise)
+				report.Outcomes = append(report.Outcomes, policiesOutcome)
+				targetResult.EnterprisePolicies = &policies
 			}
 			entScope := Scope{Host: target.Host, Kind: EnterpriseScope, Name: target.Enterprise}
 			actionsPermissions, actionsPermissionsOutcome, actionsPermissionsErr := FetchEnterpriseActionsPermissions(
@@ -212,6 +222,34 @@ func runVerticalSliceWithStore(ctx context.Context, profile *Profile, config *Cu
 			auditLogStreams, auditLogStreamsOutcome, _ := FetchEnterpriseAuditLogStreams(ctx, client, store, entScope, target.Enterprise)
 			report.Outcomes = append(report.Outcomes, auditLogStreamsOutcome)
 			targetResult.EnterpriseAuditLogStreams = &auditLogStreams
+			billing, billingOutcomes, _ := FetchEnterpriseBilling(ctx, client, store, entScope, target.Enterprise, target.Deployment)
+			report.Outcomes = append(report.Outcomes, billingOutcomes...)
+			targetResult.EnterpriseBilling = &billing
+			copilot, copilotOutcomes, _ := FetchEnterpriseCopilot(ctx, client, store, entScope, target.Enterprise, target.Deployment, lookbackStart, now)
+			report.Outcomes = append(report.Outcomes, copilotOutcomes...)
+			targetResult.EnterpriseCopilot = &copilot
+		}
+		// ent.scim_users is deliberately NOT nested inside the `target.Enterprise
+		// != ""` block above: only "emu" mode's endpoint actually requires an
+		// enterprise slug (GET /scim/v2/enterprises/{enterprise}/Users). "saml_sso"
+		// (Cloud, organization-scoped) and "ghes" (Server, appliance-wide, no
+		// enterprise/organization path segment at all) are both legitimate
+		// configurations with no enterprise slug configured at all; nesting this
+		// call inside the enterprise check silently skipped both of them despite
+		// their collector ID being registered as run-wired. A scope with an empty
+		// EnterpriseScope name would also fail Scope.Validate() outright, so a
+		// host-qualified InstanceScope is used whenever no enterprise slug is
+		// configured, falling back to the richer EnterpriseScope only when one is.
+		// This is the single call site for every SCIMMode value, including "emu",
+		// so there is no risk of double-invoking EMU mode here.
+		scimScope := Scope{Host: target.Host, Kind: InstanceScope, Name: target.Host}
+		if target.Enterprise != "" {
+			scimScope = Scope{Host: target.Host, Kind: EnterpriseScope, Name: target.Enterprise}
+		}
+		scimUsers, scimOutcomes, _ := FetchEnterpriseSCIMUsers(ctx, client, store, scimScope, target.Enterprise, target.SCIMMode, target.Deployment, target.Organizations)
+		report.Outcomes = append(report.Outcomes, scimOutcomes...)
+		if target.SCIMMode != "" {
+			targetResult.EnterpriseSCIMUsers = &scimUsers
 		}
 		if target.Deployment == Server {
 			managementClient, managementErr := newClient(target, ManagementEvidence)
@@ -227,7 +265,9 @@ func runVerticalSliceWithStore(ctx context.Context, profile *Profile, config *Cu
 		}
 		if targetResult.EnterpriseInfo != nil || targetResult.GHESManageBasics != nil ||
 			targetResult.EnterpriseActionsPermissions != nil || targetResult.EnterpriseCodeSecurityConfigs != nil ||
-			targetResult.EnterpriseAuditLog != nil || targetResult.EnterpriseAuditLogStreams != nil {
+			targetResult.EnterpriseAuditLog != nil || targetResult.EnterpriseAuditLogStreams != nil ||
+			targetResult.EnterpriseBilling != nil || targetResult.EnterpriseCopilot != nil ||
+			targetResult.EnterprisePolicies != nil || targetResult.EnterpriseSCIMUsers != nil {
 			report.Targets = append(report.Targets, targetResult)
 		}
 
@@ -268,7 +308,7 @@ func runVerticalSliceWithStore(ctx context.Context, profile *Profile, config *Cu
 				orgResult.Repositories = append(orgResult.Repositories, repoResult)
 			}
 			orgResult.Operational = analyzeOrganizationOperational(ctx, client, graphQLClient, store, orgScope, organization,
-				population.EligibleFullNames, lookbackStart, now, report, accumulator)
+				population.EligibleFullNames, target.Deployment, lookbackStart, now, report, accumulator)
 			report.Organizations = append(report.Organizations, orgResult)
 		}
 	}
@@ -316,7 +356,8 @@ func runVerticalSliceWithStore(ctx context.Context, profile *Profile, config *Cu
 // (not per repository) and folds their contribution into the run-wide
 // metric accumulator.
 func analyzeOrganizationOperational(ctx context.Context, client, graphQLClient *CollectionClient, store *EvidenceStore, orgScope Scope,
-	organization string, eligibleRepositoryFullNames []string, lookbackStart, now time.Time, report *VerticalSliceReport, accumulator *metricAccumulator) *OrganizationOperationalResult {
+	organization string, eligibleRepositoryFullNames []string, deployment Deployment, lookbackStart, now time.Time,
+	report *VerticalSliceReport, accumulator *metricAccumulator) *OrganizationOperationalResult {
 	organizationKey := orgScope.Key()
 	result := &OrganizationOperationalResult{}
 
@@ -423,6 +464,14 @@ func analyzeOrganizationOperational(ctx context.Context, client, graphQLClient *
 	campaigns, campaignsOutcomes, _ := FetchOrgCampaigns(ctx, client, store, orgScope, organization)
 	report.Outcomes = append(report.Outcomes, campaignsOutcomes...)
 	result.Campaigns = &campaigns
+
+	apiInsights, apiInsightsOutcomes, _ := FetchOrgAPIInsights(ctx, client, store, orgScope, organization, deployment, lookbackStart, now)
+	report.Outcomes = append(report.Outcomes, apiInsightsOutcomes...)
+	result.APIInsights = &apiInsights
+
+	billing, billingOutcomes, _ := FetchOrgBilling(ctx, client, store, orgScope, organization, deployment)
+	report.Outcomes = append(report.Outcomes, billingOutcomes...)
+	result.Billing = &billing
 
 	accumulator.addGovernanceCounts(installations, installationsErr == nil, hooks, pat)
 	return result

@@ -57,15 +57,19 @@ explicitly disclosed rather than assumed satisfied), enterprise audit-log
 streaming destinations, organization secret-scanning pattern settings,
 secret-scanning/push-ruleset bypass requests, security campaigns, and
 enterprise/GHES identity, Actions permissions and code security
-configurations) plus explicit, typed import contracts (schema-validated, not
+configurations, current billing usage, enterprise Copilot/policies, API Insights
+and explicitly routed SCIM) plus explicit, typed import contracts (schema-validated, not
 an untyped JSON passthrough) for the collector families that have no live
 API surface at all (GHES CLI/backup output, Management Console/UI captures,
 external status feeds, assessor interviews and documents) — **it is not a
-complete catalogue implementation**: of the full 67-collector catalogue, 44
+complete feature implementation**: of the full 67-collector catalogue, 50
 are wired into the live collection run, 16 have a typed import contract, 1
-(`ghes.meta`) is preflight-probe-only, and 6 remain fully unimplemented
-(enterprise billing, enterprise Copilot/policy settings, enterprise SCIM
-users, organization API insights and organization billing). The 16 import contracts validate
+(`ghes.meta`) is preflight-probe-only. Every catalogue ID has a declared adapter
+or import/probe path, but some descriptor subfeatures remain unsupported:
+retired legacy billing fields, per-actor API drill-downs, attestation verification,
+enterprise coverage and field-normalized UI/external evidence. SCIM requires
+explicit mode, platform and classic-PAT configuration; registration never means
+successful access. The 16 import contracts validate
 only their shared outer envelope (for example `collector_id`/`captured_by`/
 `captured_at` for a UI capture, `source`/`retrieved_at` for an external feed)
 plus that its settings/feed-content map is non-empty (has at least one key;

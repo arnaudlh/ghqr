@@ -108,6 +108,22 @@ type Target struct {
 	Enterprise    string               `yaml:"enterprise" json:"enterprise,omitempty"`
 	Organizations []string             `yaml:"organizations" json:"organizations"`
 	Credentials   CredentialReferences `yaml:"credentials" json:"credentials"`
+	// SCIMMode explicitly selects ent.scim_users' routing across three
+	// mutually exclusive, deployment-specific endpoints, confirmed via
+	// GitHub's own SCIM documentation: "emu" queries the Enterprise Managed
+	// Users SCIM endpoint (GET /scim/v2/enterprises/{enterprise}/Users,
+	// GitHub Enterprise Cloud only); "saml_sso" queries each configured
+	// organization's own SCIM endpoint (GET
+	// /scim/v2/organizations/{org}/Users, also GitHub Enterprise Cloud
+	// only); "ghes" queries the GitHub Enterprise Server appliance-wide
+	// endpoint (GET /scim/v2/Users against the appliance's own host --
+	// GitHub's GHES SCIM documentation explicitly directs callers to omit
+	// any "enterprises/{enterprise}/" or organization path segment, since
+	// GHES SCIM is appliance-wide, not enterprise- or organization-scoped).
+	// Left empty (the default), ent.scim_users is not run: EMU-vs-SAML-SSO-
+	// vs-GHES status is never inferred from SAML presence, membership
+	// counts, Deployment, or any other runtime signal.
+	SCIMMode string `yaml:"scim_mode" json:"scim_mode,omitempty"`
 }
 
 // CustomerConfig supports the brief's single-host form and explicit mixed-host targets.
@@ -127,6 +143,8 @@ type CustomerConfig struct {
 	ProductionEnvRegex string               `yaml:"production_env_regex" json:"production_env_regex"`
 	Thresholds         map[string]float64   `yaml:"thresholds" json:"thresholds"`
 	EvidenceDir        string               `yaml:"evidence_dir" json:"evidence_dir"`
+	// SCIMMode is the single-host form's equivalent of Target.SCIMMode.
+	SCIMMode string `yaml:"scim_mode" json:"scim_mode,omitempty"`
 }
 
 // LoadConfig reads strict YAML without resolving credentials or contacting GitHub.
@@ -214,7 +232,7 @@ func (c *CustomerConfig) ResolvedTargets() ([]Target, error) {
 	targets := c.Targets
 	if len(targets) != 0 {
 		if c.Enterprise != "" || c.GHESHost != "" || c.Hostname != "" || len(c.Organizations) != 0 ||
-			c.Deployment != "" || c.Credentials != (CredentialReferences{}) {
+			c.Deployment != "" || c.Credentials != (CredentialReferences{}) || c.SCIMMode != "" {
 			return nil, fmt.Errorf("targets cannot be combined with single-host scope or credential fields")
 		}
 	} else {
@@ -237,7 +255,7 @@ func (c *CustomerConfig) ResolvedTargets() ([]Target, error) {
 		if host == "" && deployment == Cloud {
 			host = "github.com"
 		}
-		targets = []Target{{host, deployment, c.Enterprise, c.Organizations, c.Credentials}}
+		targets = []Target{{host, deployment, c.Enterprise, c.Organizations, c.Credentials, c.SCIMMode}}
 	}
 	seen := map[string]bool{}
 	resolved := make([]Target, 0, len(targets))
@@ -267,6 +285,20 @@ func validateTarget(target Target) error {
 	}
 	if target.Deployment == Cloud && target.Enterprise == "" && len(target.Organizations) == 0 {
 		return fmt.Errorf("cloud target requires an explicit enterprise or organization")
+	}
+	switch target.SCIMMode {
+	case "", "emu", "saml_sso", "ghes":
+	default:
+		return fmt.Errorf("scim_mode must be empty, \"emu\", \"saml_sso\" or \"ghes\"")
+	}
+	if target.SCIMMode == "emu" && target.Enterprise == "" {
+		return fmt.Errorf("scim_mode \"emu\" requires an explicit enterprise")
+	}
+	if (target.SCIMMode == "emu" || target.SCIMMode == "saml_sso") && target.Deployment != Cloud {
+		return fmt.Errorf("scim_mode %q requires a cloud deployment (use \"ghes\" for a GitHub Enterprise Server deployment)", target.SCIMMode)
+	}
+	if target.SCIMMode == "ghes" && target.Deployment != Server {
+		return fmt.Errorf("scim_mode \"ghes\" requires a server deployment")
 	}
 	if target.Enterprise != "" {
 		if err := (Scope{target.Host, EnterpriseScope, target.Enterprise}).Validate(); err != nil {

@@ -1,16 +1,16 @@
 # Assessment collection and evidence contract
 
 The safety/evidence layer supports the separate `ghqr assess` workflow, not a
-complete scored assessment. The Phase 4 audit follow-up has **44 run-wired
+complete scored assessment. The Phase 4 adapter follow-up has **50 run-wired
 collector IDs**, **16 import-only contracts**, **one preflight-only probe**
-(`ghes.meta`) and **six unsupported catalogue IDs**. A registered ID means that
+(`ghes.meta`). Every catalogue ID has a declared path. A registered ID means that
 at least one real feature is wired; it does not mean every endpoint or metric in
 that collector's profile descriptor is implemented.
 
 Preflight's live probes remain limited to **`org.settings` and `ghes.meta`**.
-Its `implemented_collectors` metadata lists all 45 adapters/probes, while
+Its `implemented_collectors` metadata lists all 51 adapters/probes, while
 `probe_collectors` lists only these two probe contracts. Offline plans report
-45 `Ready`, 16 `ImportOnly` and six `Unimplemented` entries, all with access
+51 `Ready` and 16 `ImportOnly` entries, all with access
 `not-checked`; readiness alone never yields a score or an evidence reference.
 Probe coverage, adapter readiness, observed permission and collection
 completeness are distinct; absence of a preflight probe is not proof of absence
@@ -26,6 +26,7 @@ milestones.
 | Organization governance | `org.members`, `org.outside_collaborators`, `org.teams`, `org.roles`, `org.pat_governance`, `org.installations`, `org.hooks`, `org.rulesets`, `repo.access`, `org.actions_permissions`, `org.runners`, `org.copilot`, `org.packages`, `org.projects` |
 | Enterprise and management | `ent.info`, `ghes.manage_api`, `ent.actions_permissions`, `ent.code_security_configs` |
 | Audit and security settings | `ent.audit_log`, `org.audit_log`, `ent.audit_log_streams`, `org.secret_scanning_settings`, `org.bypass_requests`, `org.campaigns` |
+| Usage, policies and provisioning | `org.api_insights`, `org.billing`, `ent.billing`, `ent.copilot`, `ent.policies`, `ent.scim_users` |
 
 Enterprise/GHES collectors are gated by explicit target configuration, platform
 and credentials; registration is not a claim of successful access. Partial
@@ -46,10 +47,17 @@ never unverified default/enterprise inheritance or operational coverage.
 Malformed observations make the relevant typed result and collector outcome
 incomplete, retaining observed counts, page references and explicit reasons.
 
-The six unsupported IDs are `ent.billing`, `ent.copilot`, `ent.policies`,
-`ent.scim_users`, `org.api_insights` and `org.billing`. Import-only UI/external
-interiors and the partial features above also remain distinct from complete
-normalized collectors.
+Current billing adapters use documented enhanced-platform usage rather than
+inventing unavailable legacy Actions-minutes/Packages/shared-storage fields.
+API Insights provides organization summaries/time/subject statistics, not every
+per-user or per-actor drill-down. Copilot telemetry is window-limited and is not
+proof of every user's real activity. Enterprise policies preserve literal
+`NO_POLICY` rather than coercing it to false. Missing totals/amounts and malformed
+records remain unknown or incomplete with explicit outcome reasons.
+
+Import-only UI/external interiors and the partial features above remain distinct
+from complete normalized collectors. Catalogue-ID coverage does not establish
+coverage of all profile metrics, evaluator rules or live tenant permissions.
 
 ## Explicit scope and live consent
 
@@ -66,6 +74,22 @@ per-target environment references. There is no cross-host `GH_TOKEN` fallback.
 Cloud and GHES REST routes differ from GraphQL and GHES management routes.
 Management uses TLS on port 8443, `/manage/v1/`, and its separate Basic username
 and password references, never a PAT routed through `/api/v3`.
+
+SCIM is opt-in through `scim_mode`, independently for each target:
+
+| Mode | Platform/scope | Read-only endpoint |
+| --- | --- | --- |
+| `emu` | Cloud, explicit enterprise slug | `/scim/v2/enterprises/{enterprise}/Users` |
+| `saml_sso` | Cloud, explicitly configured organizations | `/scim/v2/organizations/{org}/Users` |
+| `ghes` | Server, appliance-wide; no enterprise slug required | `/api/v3/scim/v2/Users` |
+
+An empty mode is not run; SAML presence never implies EMU. SCIM requires an
+explicit classic-PAT credential route, not a fine-grained PAT, App token or
+global credential fallback. Required scopes differ by platform and actor
+(`scim:enterprise` for setup/GHES; Cloud enterprise-owner read access can use
+`admin:enterprise`). An organization-only SAML target or GHES appliance does not
+need a fabricated enterprise slug. Index/count pagination validates the server's
+actual page sizes/totals and preserves omitted totals separately from zero.
 
 Every client shares a run-wide budget of at most four in-flight full-response
 requests. REST writes are blocked. GraphQL POST is allowed only for an inspected
