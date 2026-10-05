@@ -93,6 +93,41 @@ func TestValidateImportContractPayloadGHESBackupValidatesSnapshotStatus(t *testi
 	if _, err := ValidateImportContractPayload("ghes.backup", negativeSnapshots); err == nil {
 		t.Fatal("expected a negative retained_snapshots to be rejected")
 	}
+	omittedSnapshots := []byte(`{"captured_at":"2026-10-05T00:00:00Z","latest_snapshot_status":"success"}`)
+	if _, err := ValidateImportContractPayload("ghes.backup", omittedSnapshots); err == nil {
+		t.Fatal("expected an omitted retained_snapshots to be rejected, not silently treated as 0")
+	}
+	explicitZeroSnapshots := []byte(`{"captured_at":"2026-10-05T00:00:00Z","retained_snapshots":0,"latest_snapshot_status":"failed"}`)
+	decoded, err := ValidateImportContractPayload("ghes.backup", explicitZeroSnapshots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backup, ok := decoded.(GHESBackupImport)
+	if !ok || backup.RetainedSnapshots == nil || *backup.RetainedSnapshots != 0 {
+		t.Fatalf("an explicit 0 must be accepted and preserved distinctly from omission: %+v", decoded)
+	}
+}
+
+// TestValidateImportContractPayloadGHESCLIAcceptsTimestampOnlyNoReplication
+// confirms a ghes.cli capture with no replication data (a legitimate signal
+// for a non-replicated instance, or a CLI run that found nothing to report)
+// is accepted, never rejected merely for having an empty replication list.
+func TestValidateImportContractPayloadGHESCLIAcceptsTimestampOnlyNoReplication(t *testing.T) {
+	timestampOnly := []byte(`{"captured_at":"2026-10-05T00:00:00Z","replication":[]}`)
+	decoded, err := ValidateImportContractPayload("ghes.cli", timestampOnly)
+	if err != nil {
+		t.Fatalf("a timestamp-only capture with no replication entries must be accepted: %v", err)
+	}
+	cli, ok := decoded.(GHESCLIImport)
+	if !ok || len(cli.Replication) != 0 {
+		t.Fatalf("unexpected decoded payload: %+v", decoded)
+	}
+	// The replication key itself may also be entirely omitted, not merely an
+	// empty array.
+	replicationOmitted := []byte(`{"captured_at":"2026-10-05T00:00:00Z"}`)
+	if _, err := ValidateImportContractPayload("ghes.cli", replicationOmitted); err != nil {
+		t.Fatalf("an omitted replication key must also be accepted: %v", err)
+	}
 }
 
 // TestValidateImportContractPayloadUICaptureRequiresMatchingCollectorAndFields

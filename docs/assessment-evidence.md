@@ -1,9 +1,55 @@
 # Assessment collection and evidence contract
 
-Phase 2 adds an executable safety/evidence layer, not a full live assessment.
-The implemented collector IDs are **`org.settings` and `ghes.meta`**; evaluator IDs
-remain **none**. All other 65 catalogue collectors are unimplemented and retain
-explicit reasons instead of invented successful probes.
+The safety/evidence layer supports the separate `ghqr assess` workflow, not a
+complete scored assessment. The Phase 4 audit follow-up has **44 run-wired
+collector IDs**, **16 import-only contracts**, **one preflight-only probe**
+(`ghes.meta`) and **six unsupported catalogue IDs**. A registered ID means that
+at least one real feature is wired; it does not mean every endpoint or metric in
+that collector's profile descriptor is implemented.
+
+Preflight's live probes remain limited to **`org.settings` and `ghes.meta`**.
+Its `implemented_collectors` metadata lists all 45 adapters/probes, while
+`probe_collectors` lists only these two probe contracts. Offline plans report
+45 `Ready`, 16 `ImportOnly` and six `Unimplemented` entries, all with access
+`not-checked`; readiness alone never yields a score or an evidence reference.
+Probe coverage, adapter readiness, observed permission and collection
+completeness are distinct; absence of a preflight probe is not proof of absence
+of a collection adapter. No evaluator is included in this published increment.
+Full control evaluation and raw-evidence-to-analysis replay remain later
+milestones.
+
+| Run-wired group | Exact collector IDs |
+| --- | --- |
+| Inventory, rules and workflows | `org.settings`, `org.repos`, `org.properties`, `repo.details`, `repo.rules`, `repo.workflows`, `repo.languages`, `repo.sbom` |
+| Repository activity and metadata | `repo.prs`, `repo.actions_runs`, `repo.commits`, `repo.secrets_env`, `repo.releases_packages`, `repo.discussions_projects` |
+| Security | `org.dependabot_alerts`, `org.code_scanning_alerts`, `org.secret_scanning_alerts`, `org.code_security_configs`, `repo.code_scanning`, `repo.contents_probe` |
+| Organization governance | `org.members`, `org.outside_collaborators`, `org.teams`, `org.roles`, `org.pat_governance`, `org.installations`, `org.hooks`, `org.rulesets`, `repo.access`, `org.actions_permissions`, `org.runners`, `org.copilot`, `org.packages`, `org.projects` |
+| Enterprise and management | `ent.info`, `ghes.manage_api`, `ent.actions_permissions`, `ent.code_security_configs` |
+| Audit and security settings | `ent.audit_log`, `org.audit_log`, `ent.audit_log_streams`, `org.secret_scanning_settings`, `org.bypass_requests`, `org.campaigns` |
+
+Enterprise/GHES collectors are gated by explicit target configuration, platform
+and credentials; registration is not a claim of successful access. Partial
+features include code-scanning analyses/autofix, release-attestation digest
+verification and enterprise-wide security-configuration coverage. PRs use a
+last-100-merged sample and Actions runs a most-recent-1,000 cap; those metrics
+retain sampling caveats. Failed or missing peers cannot silently reduce a
+population into a clean percentage.
+
+Audit logs use one paginated date-bounded stream with local action classification
+and event-ID deduplication. The authoritative numeric `@timestamp` is read, and
+day-granular API results are filtered to the exact requested instants. Web
+events are retained for 180 days and Git events for seven days; completing API
+pagination does not prove older Git-event coverage. Bypass inventories use the
+API's maximum month window and disclose that limitation, not a complete
+configured 90-day history. Pattern counts describe explicit overrides only,
+never unverified default/enterprise inheritance or operational coverage.
+Malformed observations make the relevant typed result and collector outcome
+incomplete, retaining observed counts, page references and explicit reasons.
+
+The six unsupported IDs are `ent.billing`, `ent.copilot`, `ent.policies`,
+`ent.scim_users`, `org.api_insights` and `org.billing`. Import-only UI/external
+interiors and the partial features above also remain distinct from complete
+normalized collectors.
 
 ## Explicit scope and live consent
 
@@ -52,8 +98,10 @@ and key collisions caused by redaction fail explicitly.
 
 Safe JSON booleans, nulls, large numeric identifiers, secret type and lifecycle
 metadata remain intact. A self-claimed `already_redacted` import flag is ignored.
-This is not a claim that arbitrary screenshots/PDFs are automatically safe; their
-import contracts are not implemented.
+This is not a claim that arbitrary screenshots/PDFs are automatically safe:
+binary images/documents are not accepted by JSON import. UI settings can be
+imported as explicit JSON transcriptions, and documents as reviewed references,
+under the contracts below.
 
 ## Raw objects, sidecars and replay
 
@@ -92,6 +140,59 @@ identity. Their actual provenance is marked `source_kind: import`, regardless of
 the claimed source in input metadata. Import/replay commands work outside the
 checkout and require no network. Replayed output remains sanitized.
 
+### Recognized import contracts
+
+For these 16 IDs, the actual `assess import` entry point validates the payload
+**before opening the evidence store or writing any evidence**. An invalid
+envelope returns an error and no success-shaped reference. Ordinary authorized
+API-collector JSON imports retain their existing behavior.
+
+| Family | Collector IDs | Envelope |
+| --- | --- | --- |
+| Customer-run GHES observations | `ghes.cli`, `ghes.backup` | Typed command/backup observations and `captured_at`; replication status is `OK`, `WARN` or `ERR`, backup status is `success`, `failed` or `unknown` |
+| UI transcriptions | `ui.ent_policies`, `ui.ent_auth`, `ui.ent_audit_settings`, `ui.org_pat_policy`, `ui.org_third_party`, `ui.org_code_security_settings`, `ui.org_copilot_policies`, `ui.org_security_overview`, `ui.org_actions_settings` | Matching `collector_id`, `captured_by`, `captured_at`, non-empty `fields` map |
+| External observations | `ext.github_status`, `ext.ghes_releases`, `ext.siem_rules` | `source`, `retrieved_at`, non-empty `payload` map |
+| Interviews | `manual.interview` | `control_id`, `assessor`, `answered_at`, `response`; optional question and evidence references |
+| Reviewed document references | `manual.document` | `control_id`, `document_title`, `reviewed_by`, `reviewed_at`; optional URL and summary |
+
+UI `fields` and external `payload` interiors remain generic maps: the envelope
+validator does not establish setting names/types, feature completeness,
+operational coverage or a control's scored state. `ImportOnly` is not a live
+collector or evaluator. A successful import proves authorized, sanitized
+storage and imported provenance, not that the supplied observations are true.
+
+For example, a UI payload accepted for metadata whose collector is
+`ui.org_security_overview` is:
+
+```json
+{
+  "collector_id": "ui.org_security_overview",
+  "captured_by": "assessor-reference",
+  "captured_at": "2026-10-05T00:00:00Z",
+  "fields": {
+    "two_factor_required": true
+  }
+}
+```
+
+Use a non-sensitive assessor reference. Matching metadata still needs the active
+profile version/SHA, authorized host-qualified scope, collection time and
+feature identity. `{"unexpected": true}` is rejected for this collector, rather
+than persisted as a valid UI capture. See
+[`import_contracts.go`](../internal/assessment/import_contracts.go) for the exact
+current shapes and validation constraints.
+
+### Integrity is not derived-analysis verification
+
+Object replay validates the stored sanitized JSON/metadata pair and its
+provenance. It does **not** prove arbitrary supplied metrics, effective rules,
+critical populations or per-repository analysis. A genuine page unrelated to a
+claimed analysis, or a workflow-only check, cannot establish that the complete
+report was re-derived. Full offline evaluation must use the same analysis
+pipeline against the required raw pages, retaining denied/incomplete outcomes
+and unknown observations; this acceptance remains open in the current
+increment.
+
 ## Validation and API drift
 
 `GOTOOLCHAIN=go1.26.0 make test` passes the fixtures and repository checks.
@@ -101,6 +202,13 @@ management credential separation, 16 requests peaking at four, successful alert
 secret/email redaction, duplicate values in comments/keys/later pages/logs,
 webhook URL stripping, atomic/idempotent pairs, tampering and scoped imports.
 The built import/replay CLI also passes a privacy smoke test outside the checkout.
+Permanent core and CLI tests exercise the recognized-import entry point:
+invalid payloads create no evidence files, while valid payloads load back with
+`source_kind: import`, matching references and sanitized sensitive fields.
+The published Phase 4 tree also passes build, vet and the full race suite without
+uncommitted evaluator files. Legacy offline mock/replay preserves 55 synthetic
+repositories and JSON/Markdown/Excel output; that is legacy compatibility, not
+full WAF replay or a production benchmark.
 No live tenant, GHES instance or production performance acceptance was exercised.
 
 Authority references:

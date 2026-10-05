@@ -50,27 +50,32 @@ lifecycles, code security configurations, membership, outside collaborators,
 teams, roles, PAT governance, installations, hooks, rulesets, repository
 access, commit-verification sampling, a dependency manifest/dependabot.yml
 probe, Actions permissions/runners/Copilot/packages/ProjectsV2, repository
-secrets/environments/releases/discussions, and enterprise/GHES identity,
-Actions permissions and code security configurations) plus explicit, typed
-import contracts (schema-validated, not an untyped JSON passthrough) for the
-collector families that have no live API surface at all (GHES CLI/backup
-output, Management Console/UI captures, external status feeds, assessor
-interviews and documents) — **it is not a complete catalogue implementation**:
-of the full 67-collector catalogue, 38 are wired into the live collection run,
-16 have a typed import contract, 1 (`ghes.meta`) is preflight-probe-only, and
-12 remain fully unimplemented (enterprise/organization audit logs and audit
-log streams, enterprise/organization billing, enterprise Copilot and policy
-settings, enterprise SCIM users, organization API insights, bypass requests,
-campaigns and secret-scanning settings). The 16 import contracts validate
+secrets/environments/releases/discussions, enterprise/organization audit
+logs (locally classified into documented security-relevant phrase
+categories, with GitHub's fixed Git-event 7-day/web-event 180-day retention
+explicitly disclosed rather than assumed satisfied), enterprise audit-log
+streaming destinations, organization secret-scanning pattern settings,
+secret-scanning/push-ruleset bypass requests, security campaigns, and
+enterprise/GHES identity, Actions permissions and code security
+configurations) plus explicit, typed import contracts (schema-validated, not
+an untyped JSON passthrough) for the collector families that have no live
+API surface at all (GHES CLI/backup output, Management Console/UI captures,
+external status feeds, assessor interviews and documents) — **it is not a
+complete catalogue implementation**: of the full 67-collector catalogue, 44
+are wired into the live collection run, 16 have a typed import contract, 1
+(`ghes.meta`) is preflight-probe-only, and 6 remain fully unimplemented
+(enterprise billing, enterprise Copilot/policy settings, enterprise SCIM
+users, organization API insights and organization billing). The 16 import contracts validate
 only their shared outer envelope (for example `collector_id`/`captured_by`/
 `captured_at` for a UI capture, `source`/`retrieved_at` for an external feed)
-plus that it carries at least one non-empty value; the actual setting/feed
-content inside that envelope remains an unvalidated, non-field-normalized
-map — this is a non-empty-envelope guarantee, not per-setting schema
-validation, and must not be read as "these collectors are fully
-field-normalized/complete". Control evaluation and contractual runtime exports
-remain subsequent milestones; this increment does not produce a complete,
-scored assessment of all 456 controls. See
+plus that its settings/feed-content map is non-empty (has at least one key;
+the values themselves, including an explicit `null`, are not checked) — the
+actual setting/feed content inside that envelope remains an unvalidated,
+non-field-normalized map — this is a non-empty-map-envelope guarantee, not
+per-setting schema or per-value validation, and must not be read as "these
+collectors are fully field-normalized/complete". Control evaluation and
+contractual runtime exports remain subsequent milestones; this increment
+does not produce a complete, scored assessment of all 456 controls. See
 [assessment status and contracts](docs/assessment.md) and
 [assessment collection and evidence contract](docs/assessment-evidence.md)
 for the offline `ghqr assess` interface, the exact implemented collector IDs,

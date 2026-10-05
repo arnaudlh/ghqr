@@ -25,9 +25,13 @@ func TestOfflinePlanDoesNotClaimCollectionOrScores(t *testing.T) {
 				expectedReadiness = Ready
 			}
 		}
+		if importContractCollectorIDSet[collector.CollectorID] {
+			expectedReadiness = ImportOnly
+		}
 		if collector.Readiness != expectedReadiness || collector.Availability != NotChecked || collector.Reason == "" {
 			t.Fatalf("plan invented collector feasibility: %+v", collector)
 		}
+
 	}
 	for _, result := range plan.Results {
 		if result.ProposedState != NotAssessed || result.Confidence != LowConfidence ||
@@ -91,5 +95,36 @@ func TestPlanRejectsNilInputs(t *testing.T) {
 	}
 	if _, err := BuildPlan(fixtureProfile(t), nil); err == nil {
 		t.Fatal("nil customer configuration accepted")
+	}
+}
+
+func TestOfflinePlanReportsAdapterAndImportReadinessWithoutAccess(t *testing.T) {
+	profile, err := LoadDefaultProfile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := ParseConfig([]byte("organizations: [fixture-org]"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := BuildPlan(profile, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := map[Readiness]int{}
+	for _, collector := range plan.Collectors {
+		counts[collector.Readiness]++
+		if collector.Availability != NotChecked || collector.Reason == "" {
+			t.Fatalf("offline plan invented access: %+v", collector)
+		}
+	}
+	if counts[Ready] != len(ImplementedCollectorIDs()) || counts[ImportOnly] != len(ImportContractCollectorIDs()) ||
+		counts[Unimplemented] != len(profile.Collectors)-counts[Ready]-counts[ImportOnly] {
+		t.Fatalf("offline readiness catalogue is inconsistent: %+v", counts)
+	}
+	for _, result := range plan.Results {
+		if (result.ProposedState != NotAssessed && result.ProposedState != NotApplicable) || len(result.EvidenceRefs) != 0 {
+			t.Fatalf("readiness was mistaken for a scored control: %+v", result)
+		}
 	}
 }

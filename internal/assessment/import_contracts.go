@@ -88,11 +88,14 @@ func (i GHESCLIImport) validate() error {
 // GHESBackupImport is the ghes.backup collector's import contract: the
 // customer's backup-utils host state (backup.config fields, retained
 // snapshot count, latest snapshot outcome). storage_location/encrypted are
-// collected as plain descriptive fields, never credentials.
+// collected as plain descriptive fields, never credentials. RetainedSnapshots
+// is a pointer so an omitted field is preserved as unknown rather than
+// collapsing to the same zero value as an explicitly reported "0 retained
+// snapshots" -- a meaningfully different, and more alarming, signal.
 type GHESBackupImport struct {
 	CapturedAt             time.Time  `json:"captured_at"`
 	ScheduleCronExpression string     `json:"schedule_cron_expression"`
-	RetainedSnapshots      int        `json:"retained_snapshots"`
+	RetainedSnapshots      *int       `json:"retained_snapshots"`
 	LatestSnapshotAt       *time.Time `json:"latest_snapshot_at,omitempty"`
 	LatestSnapshotStatus   string     `json:"latest_snapshot_status"`
 	StorageLocation        string     `json:"storage_location,omitempty"`
@@ -103,7 +106,10 @@ func (i GHESBackupImport) validate() error {
 	if i.CapturedAt.IsZero() {
 		return fmt.Errorf("ghes.backup import requires captured_at")
 	}
-	if i.RetainedSnapshots < 0 {
+	if i.RetainedSnapshots == nil {
+		return fmt.Errorf("ghes.backup import requires retained_snapshots (explicitly, not omitted)")
+	}
+	if *i.RetainedSnapshots < 0 {
 		return fmt.Errorf("ghes.backup retained_snapshots must not be negative")
 	}
 	switch i.LatestSnapshotStatus {

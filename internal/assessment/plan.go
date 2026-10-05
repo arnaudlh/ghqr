@@ -51,6 +51,10 @@ func BuildPlan(profile *Profile, config *CustomerConfig) (*Plan, error) {
 				reason = "collector implementation is registered; access has not been probed by this offline plan"
 			}
 		}
+		if importContractCollectorIDSet[collector.ID] {
+			readiness = ImportOnly
+			reason = "import contract is registered; no live collection or payload validation performed by this offline plan"
+		}
 		plan.Collectors = append(plan.Collectors, CollectorPlan{
 			CollectorID: collector.ID, Readiness: readiness, Availability: NotChecked, Reason: reason,
 		})

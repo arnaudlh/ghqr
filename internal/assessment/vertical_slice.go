@@ -29,6 +29,7 @@ func RunImplementedCollectorIDs() []string {
 	// lookup); this run loop now calls every EnterpriseCollectorIDs() entry,
 	// including ent.info/ghes.manage_api (gated by target Enterprise/Deployment).
 	ids = append(ids, EnterpriseCollectorIDs()...)
+	ids = append(ids, AuditCollectorIDs()...)
 	return ids
 }
 
@@ -55,23 +56,27 @@ type RepositoryRunResult struct {
 // membership and governance inventories). It is additive to
 // OrganizationRunResult's existing Scope/Population/Repositories fields.
 type OrganizationOperationalResult struct {
-	DependabotAlerts           *OrgAlertLifecycleResult       `json:"dependabot_alerts,omitempty"`
-	CodeScanningAlerts         *OrgAlertLifecycleResult       `json:"code_scanning_alerts,omitempty"`
-	SecretScanningAlerts       *OrgAlertLifecycleResult       `json:"secret_scanning_alerts,omitempty"`
-	CodeSecurityConfigCoverage *MetricValue                   `json:"code_security_configuration_coverage,omitempty"`
-	Membership                 *OrgMembershipResult           `json:"membership,omitempty"`
-	OutsideCollaborators       *OrgOutsideCollaboratorsResult `json:"outside_collaborators,omitempty"`
-	Teams                      []teamSummary                  `json:"teams,omitempty"`
-	Roles                      *OrgRolesResult                `json:"roles,omitempty"`
-	PATGovernance              *OrgPATGovernanceResult        `json:"pat_governance,omitempty"`
-	Installations              *OrgInstallationsResult        `json:"installations,omitempty"`
-	Hooks                      *OrgHooksResult                `json:"hooks,omitempty"`
-	Rulesets                   *OrgRulesetsResult             `json:"rulesets,omitempty"`
-	ActionsPermissions         *OrgActionsPermissionsResult   `json:"actions_permissions,omitempty"`
-	Runners                    *OrgRunnersResult              `json:"runners,omitempty"`
-	Copilot                    *OrgCopilotResult              `json:"copilot,omitempty"`
-	Packages                   *OrgPackagesResult             `json:"packages,omitempty"`
-	Projects                   *OrgProjectsResult             `json:"projects,omitempty"`
+	DependabotAlerts           *OrgAlertLifecycleResult         `json:"dependabot_alerts,omitempty"`
+	CodeScanningAlerts         *OrgAlertLifecycleResult         `json:"code_scanning_alerts,omitempty"`
+	SecretScanningAlerts       *OrgAlertLifecycleResult         `json:"secret_scanning_alerts,omitempty"`
+	CodeSecurityConfigCoverage *MetricValue                     `json:"code_security_configuration_coverage,omitempty"`
+	Membership                 *OrgMembershipResult             `json:"membership,omitempty"`
+	OutsideCollaborators       *OrgOutsideCollaboratorsResult   `json:"outside_collaborators,omitempty"`
+	Teams                      []teamSummary                    `json:"teams,omitempty"`
+	Roles                      *OrgRolesResult                  `json:"roles,omitempty"`
+	PATGovernance              *OrgPATGovernanceResult          `json:"pat_governance,omitempty"`
+	Installations              *OrgInstallationsResult          `json:"installations,omitempty"`
+	Hooks                      *OrgHooksResult                  `json:"hooks,omitempty"`
+	Rulesets                   *OrgRulesetsResult               `json:"rulesets,omitempty"`
+	ActionsPermissions         *OrgActionsPermissionsResult     `json:"actions_permissions,omitempty"`
+	Runners                    *OrgRunnersResult                `json:"runners,omitempty"`
+	Copilot                    *OrgCopilotResult                `json:"copilot,omitempty"`
+	Packages                   *OrgPackagesResult               `json:"packages,omitempty"`
+	Projects                   *OrgProjectsResult               `json:"projects,omitempty"`
+	AuditLog                   *AuditLogResult                  `json:"audit_log,omitempty"`
+	SecretScanningSettings     *OrgSecretScanningSettingsResult `json:"secret_scanning_settings,omitempty"`
+	BypassRequests             *OrgBypassRequestsResult         `json:"bypass_requests,omitempty"`
+	Campaigns                  *OrgCampaignsResult              `json:"campaigns,omitempty"`
 }
 
 // TargetOperationalResult is one host target's enterprise-/instance-scoped
@@ -84,6 +89,8 @@ type TargetOperationalResult struct {
 	GHESManageBasics              *GHESManageBasicsResult              `json:"ghes_manage_basics,omitempty"`
 	EnterpriseActionsPermissions  *EnterpriseActionsPermissionsResult  `json:"enterprise_actions_permissions,omitempty"`
 	EnterpriseCodeSecurityConfigs *EnterpriseCodeSecurityConfigsResult `json:"enterprise_code_security_configs,omitempty"`
+	EnterpriseAuditLog            *AuditLogResult                      `json:"enterprise_audit_log,omitempty"`
+	EnterpriseAuditLogStreams     *EnterpriseAuditLogStreamsResult     `json:"enterprise_audit_log_streams,omitempty"`
 }
 
 // OrganizationRunResult is one organization scope's population and
@@ -199,6 +206,12 @@ func runVerticalSliceWithStore(ctx context.Context, profile *Profile, config *Cu
 				ctx, client, store, entScope, target.Enterprise)
 			report.Outcomes = append(report.Outcomes, codeSecurityConfigsOutcomes...)
 			targetResult.EnterpriseCodeSecurityConfigs = &codeSecurityConfigs
+			auditLog, auditLogOutcome, _ := FetchEnterpriseAuditLog(ctx, client, store, entScope, target.Enterprise, lookbackStart, now)
+			report.Outcomes = append(report.Outcomes, auditLogOutcome)
+			targetResult.EnterpriseAuditLog = &auditLog
+			auditLogStreams, auditLogStreamsOutcome, _ := FetchEnterpriseAuditLogStreams(ctx, client, store, entScope, target.Enterprise)
+			report.Outcomes = append(report.Outcomes, auditLogStreamsOutcome)
+			targetResult.EnterpriseAuditLogStreams = &auditLogStreams
 		}
 		if target.Deployment == Server {
 			managementClient, managementErr := newClient(target, ManagementEvidence)
@@ -213,7 +226,8 @@ func runVerticalSliceWithStore(ctx context.Context, profile *Profile, config *Cu
 			}
 		}
 		if targetResult.EnterpriseInfo != nil || targetResult.GHESManageBasics != nil ||
-			targetResult.EnterpriseActionsPermissions != nil || targetResult.EnterpriseCodeSecurityConfigs != nil {
+			targetResult.EnterpriseActionsPermissions != nil || targetResult.EnterpriseCodeSecurityConfigs != nil ||
+			targetResult.EnterpriseAuditLog != nil || targetResult.EnterpriseAuditLogStreams != nil {
 			report.Targets = append(report.Targets, targetResult)
 		}
 
@@ -254,7 +268,7 @@ func runVerticalSliceWithStore(ctx context.Context, profile *Profile, config *Cu
 				orgResult.Repositories = append(orgResult.Repositories, repoResult)
 			}
 			orgResult.Operational = analyzeOrganizationOperational(ctx, client, graphQLClient, store, orgScope, organization,
-				population.EligibleFullNames, report, accumulator)
+				population.EligibleFullNames, lookbackStart, now, report, accumulator)
 			report.Organizations = append(report.Organizations, orgResult)
 		}
 	}
@@ -273,14 +287,19 @@ func runVerticalSliceWithStore(ctx context.Context, profile *Profile, config *Cu
 			"history; the resulting Metric values are marked Sampled",
 		"org.teams/org.roles/org.pat_governance/org.installations/org.hooks/org.actions_permissions/org.runners/org.copilot/"+
 			"org.packages/org.projects/ent.actions_permissions/ent.code_security_configs/repo.secrets_env/"+
-			"repo.releases_packages/repo.discussions_projects are collection-only in this phase: their evidence and raw counts "+
-			"are reported per organization/repository/target, but no coverage/compliance ratio or ControlResult is derived from "+
-			"them in the pooled Metrics map yet (ent.code_security_configs in particular has no enterprise-wide eligible-"+
-			"repository population available in this run loop, so configuration_coverage_pct is left uncomputed at that scope)",
-		"org.audit_log/ent.audit_log (phrase-based sampling across a documented set of security-relevant audit phrases), "+
-			"ent.scim_users (enterprise/organization SCIM user provisioning roster) remain fully unimplemented this phase: "+
-			"the phrase-sampling design and the EMU-vs-SAML-SSO SCIM routing decision were not resolved with enough confidence "+
-			"to implement without risking a misleading partial result")
+			"repo.releases_packages/repo.discussions_projects/org.audit_log/ent.audit_log/ent.audit_log_streams/"+
+			"org.secret_scanning_settings/org.bypass_requests/org.campaigns are collection-only in this phase: their evidence "+
+			"and raw counts are reported per organization/repository/target, but no coverage/compliance ratio or ControlResult "+
+			"is derived from them in the pooled Metrics map yet (ent.code_security_configs in particular has no enterprise-wide "+
+			"eligible-repository population available in this run loop, so configuration_coverage_pct is left uncomputed at "+
+			"that scope)",
+		"org.audit_log/ent.audit_log classify every retrieved event locally into the profile's documented phrase categories "+
+			"from one single, full, date-bounded pull (not one live query per phrase); Git-category events are retained by "+
+			"GitHub for only 7 days regardless of the requested lookback, so a longer configured window cannot be claimed as "+
+			"fully achieved for Git events specifically (web events are retained 180 days) -- AuditLogResult.EarliestEntryAt "+
+			"discloses what was actually observed rather than assuming the requested window was satisfied",
+		"ent.scim_users remains fully unimplemented this phase: the EMU-vs-SAML-SSO routing decision and PII handling were "+
+			"not resolved with enough confidence to implement without risking a misleading partial result")
 
 	if err := store.WriteReport("run.json", report); err != nil {
 		return nil, err
@@ -297,7 +316,7 @@ func runVerticalSliceWithStore(ctx context.Context, profile *Profile, config *Cu
 // (not per repository) and folds their contribution into the run-wide
 // metric accumulator.
 func analyzeOrganizationOperational(ctx context.Context, client, graphQLClient *CollectionClient, store *EvidenceStore, orgScope Scope,
-	organization string, eligibleRepositoryFullNames []string, report *VerticalSliceReport, accumulator *metricAccumulator) *OrganizationOperationalResult {
+	organization string, eligibleRepositoryFullNames []string, lookbackStart, now time.Time, report *VerticalSliceReport, accumulator *metricAccumulator) *OrganizationOperationalResult {
 	organizationKey := orgScope.Key()
 	result := &OrganizationOperationalResult{}
 
@@ -385,6 +404,25 @@ func analyzeOrganizationOperational(ctx context.Context, client, graphQLClient *
 	if projectsErr == nil {
 		result.Projects = &projects
 	}
+
+	auditLog, auditLogOutcome, _ := FetchOrgAuditLog(ctx, client, store, orgScope, organization, lookbackStart, now)
+	report.Outcomes = append(report.Outcomes, auditLogOutcome)
+	result.AuditLog = &auditLog
+
+	secretScanningSettings, secretScanningSettingsOutcome, secretScanningSettingsErr := FetchOrgSecretScanningSettings(
+		ctx, client, store, orgScope, organization)
+	report.Outcomes = append(report.Outcomes, secretScanningSettingsOutcome)
+	if secretScanningSettingsErr == nil {
+		result.SecretScanningSettings = &secretScanningSettings
+	}
+
+	bypassRequests, bypassRequestsOutcomes, _ := FetchOrgBypassRequests(ctx, client, store, orgScope, organization)
+	report.Outcomes = append(report.Outcomes, bypassRequestsOutcomes...)
+	result.BypassRequests = &bypassRequests
+
+	campaigns, campaignsOutcomes, _ := FetchOrgCampaigns(ctx, client, store, orgScope, organization)
+	report.Outcomes = append(report.Outcomes, campaignsOutcomes...)
+	result.Campaigns = &campaigns
 
 	accumulator.addGovernanceCounts(installations, installationsErr == nil, hooks, pat)
 	return result

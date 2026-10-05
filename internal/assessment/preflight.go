@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"sort"
 	"time"
 )
 
@@ -24,13 +25,46 @@ type FeasibilityReport struct {
 	Profile               ProfileSummary         `json:"profile"`
 	CollectedAt           time.Time              `json:"collected_at"`
 	ImplementedCollectors []string               `json:"implemented_collectors"`
+	ProbeCollectors       []string               `json:"probe_collectors"`
 	ImplementedEvaluators []string               `json:"implemented_evaluators"`
 	Collectors            []CollectorFeasibility `json:"collectors"`
 }
 
-// ImplementedCollectorIDs reports implemented endpoint contracts separately from catalogue IDs.
+// ImplementedCollectorIDs lists collection adapters and preflight-only probes.
+// It excludes import-only contracts and does not establish access or completeness.
 func ImplementedCollectorIDs() []string {
+	ids := append([]string{}, RunImplementedCollectorIDs()...)
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		seen[id] = true
+	}
+	for _, id := range PreflightProbeCollectorIDs() {
+		if !seen[id] {
+			ids = append(ids, id)
+			seen[id] = true
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// PreflightProbeCollectorIDs lists the narrow set of pre-run access probes.
+func PreflightProbeCollectorIDs() []string {
 	return []string{"org.settings", "ghes.meta"}
+}
+
+// runImplementedCollectorIDSet mirrors RunImplementedCollectorIDs() for O(1)
+// feasibility lookups, built once from the same registry the live run loop
+// uses -- this is the actual adapter-implementation registry, never
+// hand-maintained separately.
+var runImplementedCollectorIDSet = buildRunImplementedCollectorIDSet()
+
+func buildRunImplementedCollectorIDSet() map[string]bool {
+	set := make(map[string]bool, len(RunImplementedCollectorIDs()))
+	for _, id := range RunImplementedCollectorIDs() {
+		set[id] = true
+	}
+	return set
 }
 
 // RunPreflight executes only explicitly scoped implemented probes and saves all outcomes.
@@ -73,6 +107,7 @@ func preflightWithStore(ctx context.Context, profile *Profile, targets []Target,
 	newClient func(Target) (*CollectionClient, error)) (*FeasibilityReport, error) {
 	report := &FeasibilityReport{
 		Profile: profile.Summary(), CollectedAt: clock.Now(), ImplementedCollectors: ImplementedCollectorIDs(),
+		ProbeCollectors:       PreflightProbeCollectorIDs(),
 		ImplementedEvaluators: []string{}, Collectors: []CollectorFeasibility{},
 	}
 	for _, collector := range profile.Collectors {
@@ -130,6 +165,16 @@ func preflightWithStore(ctx context.Context, profile *Profile, targets []Target,
 			item.Readiness = ImportOnly
 			item.Reason = "no live API surface exists for this collector; it accepts only an explicitly supplied, " +
 				"schema-validated import payload (see ValidateImportContractPayload) and is never auto-probed"
+		} else if runImplementedCollectorIDSet[collector.ID] {
+			// This collector has a real collection adapter used by `ghqr
+			// assess run` (for example org.members), but this preflight pass
+			// only issues an explicit pre-run access probe for org.settings/
+			// ghes.meta above. Ready here means "an implementation exists",
+			// not "this probe verified live access" -- Outcomes stays empty
+			// and no request is made, so this must never be confused with a
+			// probed, Outcome-backed Ready result.
+			item.Readiness = Ready
+			item.Reason = "implemented collection adapter; no preflight probe attempted/availability not checked"
 		}
 		report.Collectors = append(report.Collectors, item)
 	}
