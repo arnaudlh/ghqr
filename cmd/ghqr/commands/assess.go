@@ -20,7 +20,9 @@ func newAssessCommand() *cobra.Command {
 	command := &cobra.Command{
 		Use: "assess", Short: "Inspect the evidence-backed Well-Architected assessment foundation",
 		Long: "A separate assessment workflow with a bundled version-2 profile and explicit customer configuration.\n" +
-			"Profile and plan operations are offline. Collection and scoring are not implemented yet.",
+			"Profile and plan operations are offline. Preflight and run require explicit --live consent before contacting " +
+			"GitHub; import and replay operate on explicit offline evidence. Full control scoring and interview evaluators " +
+			"are not implemented yet.",
 		Args: cobra.NoArgs,
 	}
 	command.PersistentFlags().StringVar(&profilePath, "profile", "", "Override the bundled version-2 profile with an explicit automation-spec.json")
@@ -61,15 +63,7 @@ func newAssessCommand() *cobra.Command {
 			return nil
 		},
 	})
-	for _, operation := range []string{"run"} {
-		command.AddCommand(&cobra.Command{
-			Use: operation, Short: "Not implemented; returns an explicit error without network access",
-			Args: cobra.NoArgs,
-			RunE: func(cmd *cobra.Command, args []string) error {
-				return fmt.Errorf("assessment %s is not implemented; assess plan is offline planning, not preflight or scoring", cmd.Name())
-			},
-		})
-	}
 	addAssessmentCollectionCommands(command, &profilePath, &configPath)
+	addAssessmentRunCommand(command, &profilePath, &configPath)
 	return command
 }

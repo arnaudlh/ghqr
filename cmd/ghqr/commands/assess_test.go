@@ -25,23 +25,19 @@ func TestAssessCommandDiscovery(t *testing.T) {
 	}
 }
 
-func TestAssessmentUnimplementedOperationsFailExplicitly(t *testing.T) {
-	for _, operation := range []string{"run"} {
-		t.Run(operation, func(t *testing.T) {
-			command := newAssessCommand()
-			var output bytes.Buffer
-			command.SetOut(&output)
-			command.SetErr(&output)
-			command.SilenceErrors, command.SilenceUsage = true, true
-			command.SetArgs([]string{operation})
-			err := command.Execute()
-			if err == nil || !strings.Contains(err.Error(), "not implemented") {
-				t.Fatalf("unimplemented operation reported success: %v", err)
-			}
-			if output.Len() != 0 {
-				t.Fatalf("unimplemented operation emitted a success-shaped result: %s", output.String())
-			}
-		})
+func TestAssessmentRunRequiresExplicitLiveConsent(t *testing.T) {
+	command := newAssessCommand()
+	var output bytes.Buffer
+	command.SetOut(&output)
+	command.SetErr(&output)
+	command.SilenceErrors, command.SilenceUsage = true, true
+	command.SetArgs([]string{"run"})
+	err := command.Execute()
+	if err == nil || !strings.Contains(err.Error(), "--live") {
+		t.Fatalf("run implicitly contacted configured targets: %v", err)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("unconsented run emitted a success-shaped result: %s", output.String())
 	}
 }
 
