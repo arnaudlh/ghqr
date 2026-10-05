@@ -58,6 +58,12 @@ func TestPreflightReportsRealProbesSeparatelyFromCatalogueReadiness(t *testing.T
 				t.Fatal("forbidden metadata probe was guessed as available")
 			}
 		default:
+			if importContractCollectorIDSet[item.CollectorID] {
+				if item.Readiness != ImportOnly || len(item.Outcomes) != 0 || item.Reason == "" {
+					t.Fatal("import-contract collector should report explicit ImportOnly readiness, no probe outcomes and a reason")
+				}
+				continue
+			}
 			if item.Readiness != Unimplemented || len(item.Outcomes) != 0 || item.Reason == "" {
 				t.Fatal("unimplemented collector received a fake access probe")
 			}

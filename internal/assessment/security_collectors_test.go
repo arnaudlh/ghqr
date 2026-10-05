@@ -1,0 +1,551 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+package assessment
+
+import (
+	"context"
+	"encoding/base64"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
+
+// TestFetchOrgDependabotAlertsOpenAndClosedLifecycles exercises the open and
+// closed (fixed/dismissed/auto_dismissed) state fetches, confirms both are
+// folded into one observation set and confirms a dismissed alert is
+// preserved (for population completeness) even though the published
+// AlertLifecycleMetrics helper excludes dismissals from MTTR.
+func TestFetchOrgDependabotAlertsOpenAndClosedLifecycles(t *testing.T) {
+	created := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	fixedAt := created.Add(48 * time.Hour)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Query().Get("state") {
+		case "open":
+			writeJSON(t, writer, []map[string]any{
+				{"number": 1, "state": "open", "created_at": created.Format(time.RFC3339),
+					"security_advisory": map[string]any{"severity": "high"}},
+			})
+		case "fixed,dismissed,auto_dismissed":
+			writeJSON(t, writer, []map[string]any{
+				{"number": 2, "state": "fixed", "created_at": created.Format(time.RFC3339), "fixed_at": fixedAt.Format(time.RFC3339)},
+				{"number": 3, "state": "dismissed", "created_at": created.Format(time.RFC3339), "dismissed_reason": "tolerable_risk"},
+			})
+		default:
+			writer.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	scope := Scope{client.base.Hostname(), OrganizationScope, "fixture-org"}
+
+	result, outcomes, err := FetchOrgDependabotAlerts(context.Background(), client, store, scope, "fixture-org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outcomes) != 2 || !result.Complete || len(result.Observations) != 3 {
+		t.Fatalf("expected 3 pooled observations from 2 complete state fetches: %+v", result)
+	}
+
+	metrics, err := AlertLifecycleMetrics(result.Observations, created.Add(-180*24*time.Hour), created.Add(72*time.Hour), result.Complete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metrics["mttr_days"].Status != MetricKnown || metrics["mttr_days"].Number == nil || *metrics["mttr_days"].Number != 2 {
+		t.Fatalf("expected MTTR computed only from the fixed alert (2 days), dismissals excluded: %+v", metrics["mttr_days"])
+	}
+	if metrics["median_open_alert_age_days"].Status != MetricKnown {
+		t.Fatalf("expected a known open-alert age from the one open alert: %+v", metrics["median_open_alert_age_days"])
+	}
+}
+
+// TestFetchOrgDependabotAlertsFullPaginationAcrossOrganizationsNoDoubleCount
+// uses only synthetic fixture data (no real tenant organization names,
+// reports or tokens appear anywhere in this test) to confirm this package's
+// alert collection and pooling do not repeat two previously observed
+// external failure modes: silently truncating a large alert population at
+// a single ~100-item page, and inconsistently mixing enterprise- and
+// organization-scoped aggregation so the same alerts are counted more than
+// once (or an incomplete organization's gap is masked as a clean figure).
+// Organization A alone has 400 alerts spread across 5 actually-fetched
+// pages (3 open including 7 critical + 200 high + 13 low, 2 closed/fixed
+// including 50 critical-severity fixes); organization B has a clean 17
+// open alerts but an induced failure on its closed-alert page, which must
+// propagate as an explicit incomplete/unknown result, never a lower-bound
+// number presented as clean.
+func TestFetchOrgDependabotAlertsFullPaginationAcrossOrganizationsNoDoubleCount(t *testing.T) {
+	created := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	fixedAt := created.Add(24 * time.Hour)
+
+	openSeverities := make([]string, 0, 220)
+	for i := 0; i < 7; i++ {
+		openSeverities = append(openSeverities, "critical")
+	}
+	for i := 0; i < 200; i++ {
+		openSeverities = append(openSeverities, "high")
+	}
+	for i := 0; i < 13; i++ {
+		openSeverities = append(openSeverities, "low")
+	}
+	const closedTotal = 180
+	const closedCriticalCount = 50
+
+	const pageSize = 100
+	var orgBClosedAttempts int
+	var server *httptest.Server
+	server = httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		query := request.URL.Query()
+		page := 1
+		if value := query.Get("page"); value != "" {
+			if parsed, convErr := strconv.Atoi(value); convErr == nil {
+				page = parsed
+			}
+		}
+		writePage := func(total int, build func(index int) map[string]any) {
+			start := (page - 1) * pageSize
+			end := min(start+pageSize, total)
+			if start > total {
+				start, end = total, total
+			}
+			if end < total {
+				next := *request.URL
+				nextQuery := next.Query()
+				nextQuery.Set("page", strconv.Itoa(page+1))
+				next.RawQuery = nextQuery.Encode()
+				writer.Header().Set("Link", "<"+server.URL+next.RequestURI()+">; rel=\"next\"")
+			}
+			items := make([]map[string]any, 0, end-start)
+			for i := start; i < end; i++ {
+				items = append(items, build(i))
+			}
+			writeJSON(t, writer, items)
+		}
+		switch {
+		case request.URL.Path == "/orgs/synthetic-org-a/dependabot/alerts" && query.Get("state") == "open":
+			writePage(len(openSeverities), func(i int) map[string]any {
+				return map[string]any{
+					"number": i + 1, "state": "open", "created_at": created.Format(time.RFC3339),
+					"security_advisory": map[string]any{"severity": openSeverities[i]},
+				}
+			})
+		case request.URL.Path == "/orgs/synthetic-org-a/dependabot/alerts" && query.Get("state") == "fixed,dismissed,auto_dismissed":
+			writePage(closedTotal, func(i int) map[string]any {
+				severity := "low"
+				if i < closedCriticalCount {
+					severity = "critical"
+				}
+				return map[string]any{
+					"number": 1000 + i, "state": "fixed", "created_at": created.Format(time.RFC3339),
+					"fixed_at": fixedAt.Format(time.RFC3339), "security_advisory": map[string]any{"severity": severity},
+				}
+			})
+		case request.URL.Path == "/orgs/synthetic-org-b/dependabot/alerts" && query.Get("state") == "open":
+			writePage(17, func(i int) map[string]any {
+				return map[string]any{"number": i + 1, "state": "open", "created_at": created.Format(time.RFC3339)}
+			})
+		case request.URL.Path == "/orgs/synthetic-org-b/dependabot/alerts" && query.Get("state") == "fixed,dismissed,auto_dismissed":
+			// Synthetic induced failure: this organization's closed-alert
+			// collection always fails, simulating a genuinely incomplete
+			// organization rather than an empty, clean one.
+			orgBClosedAttempts++
+			writer.WriteHeader(http.StatusInternalServerError)
+		default:
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	scopeA := Scope{client.base.Hostname(), OrganizationScope, "synthetic-org-a"}
+	scopeB := Scope{client.base.Hostname(), OrganizationScope, "synthetic-org-b"}
+
+	resultA, outcomesA, err := FetchOrgDependabotAlerts(context.Background(), client, store, scopeA, "synthetic-org-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resultA.Complete || len(resultA.Observations) != len(openSeverities)+closedTotal {
+		t.Fatalf("expected a fully paginated %d-alert organization A population, got %d (complete=%v)",
+			len(openSeverities)+closedTotal, len(resultA.Observations), resultA.Complete)
+	}
+	pagesSeen := 0
+	for _, outcome := range outcomesA {
+		pagesSeen += outcome.Pages
+	}
+	if pagesSeen < 5 {
+		t.Fatalf("expected at least 5 actually-fetched pages (3 open + 2 closed) for organization A, got %d", pagesSeen)
+	}
+
+	resultB, _, err := FetchOrgDependabotAlerts(context.Background(), client, store, scopeB, "synthetic-org-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resultB.Complete {
+		t.Fatal("organization B's induced closed-alert collection failure must mark the result incomplete, not clean")
+	}
+	if len(resultB.Observations) != 17 {
+		t.Fatalf("organization B's successfully collected open alerts must still be preserved for audit: got %d", len(resultB.Observations))
+	}
+	if orgBClosedAttempts == 0 {
+		t.Fatal("test fixture never actually attempted organization B's closed-alert page")
+	}
+
+	accumulator := newMetricAccumulator()
+	accumulator.addDependabotAlerts(scopeA.Key(), resultA)
+	accumulator.addDependabotAlerts(scopeB.Key(), resultB)
+
+	if got := len(accumulator.dependabot.byOrganization[scopeA.Key()]); got != len(openSeverities)+closedTotal {
+		t.Fatalf("organization A's own bucket must hold exactly its own %d alerts, got %d", len(openSeverities)+closedTotal, got)
+	}
+	if got := len(accumulator.dependabot.byOrganization[scopeB.Key()]); got != 17 {
+		t.Fatalf("organization B's own bucket must hold exactly its own 17 alerts, got %d", got)
+	}
+	wantOverall := len(openSeverities) + closedTotal + 17
+	if got := len(accumulator.dependabot.overall); got != wantOverall {
+		t.Fatalf("the pooled run-wide bucket must equal the sum of both organizations' alerts exactly once each (%d), got %d -- "+
+			"a higher count would indicate double counting (for example an enterprise-level and organization-level aggregation "+
+			"of the same alerts), a lower count would indicate silent truncation", wantOverall, got)
+	}
+	if !accumulator.dependabot.overallIncomplete {
+		t.Fatal("one incomplete organization must mark the pooled bucket incomplete, not a clean aggregate")
+	}
+	if !accumulator.dependabot.incompleteByOrg[scopeB.Key()] {
+		t.Fatal("organization B specifically must be flagged incomplete")
+	}
+	if accumulator.dependabot.incompleteByOrg[scopeA.Key()] {
+		t.Fatal("organization A's own completeness must not be downgraded by organization B's unrelated failure")
+	}
+
+	metrics := map[string]Metric{}
+	if err := accumulator.populateAlertMetrics(metrics, created.Add(-180*24*time.Hour), created.Add(240*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	if value := metrics["dependabot_alerts_mttr_days"].PerOrganization[scopeA.Key()]; value.Status != MetricKnown {
+		t.Fatalf("organization A's own MTTR must remain known despite organization B's unrelated failure: %+v", value)
+	}
+	if value := metrics["dependabot_alerts_mttr_days"].PerOrganization[scopeB.Key()]; value.Status != MetricUnavailable {
+		t.Fatalf("organization B's incomplete MTTR must be explicitly unavailable, not a false clean/zero value: %+v", value)
+	}
+	if metrics["dependabot_alerts_mttr_days"].Overall.Status != MetricUnavailable {
+		t.Fatalf("the pooled run-wide MTTR must be unavailable, not a clean figure silently computed over an incomplete "+
+			"contributor: %+v", metrics["dependabot_alerts_mttr_days"].Overall)
+	}
+	// SEC-003's exact declared severity-filtered MTTR key, isolated to
+	// organization A, must reflect only its own 50 critical-severity fixed
+	// alerts (never organization B's, and never diluted by the 13 low-severity
+	// open alerts, which carry no eligible fix).
+	severityPerOrgA := metrics["dependabot_mttr_days_crit_high"].PerOrganization[scopeA.Key()]
+	if severityPerOrgA.Status != MetricKnown || severityPerOrgA.Number == nil || *severityPerOrgA.Number != 1 {
+		t.Fatalf("organization A's severity-filtered MTTR must be known and computed only from its 50 critical fixes (1 day each): %+v",
+			severityPerOrgA)
+	}
+}
+
+// TestFetchOrgSecretScanningAlertsResolutionTaxonomyAndRedaction confirms the
+// open/resolved state mapping, that revoked/false_positive/unknown
+// resolutions are distinguished per the published helper's contract, and
+// that the literal secret value is never present in persisted evidence
+// despite appearing in the raw upstream response.
+func TestFetchOrgSecretScanningAlertsResolutionTaxonomyAndRedaction(t *testing.T) {
+	created := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	resolvedAt := created.Add(24 * time.Hour)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Query().Get("hide_secret") != "true" {
+			t.Error("secret-scanning request must set hide_secret=true")
+		}
+		switch request.URL.Query().Get("state") {
+		case "open":
+			writeJSON(t, writer, []map[string]any{
+				{"number": 1, "state": "open", "secret": "dummy-sensitive-value", "secret_type": "generic",
+					"created_at": created.Format(time.RFC3339)},
+			})
+		case "resolved":
+			writeJSON(t, writer, []map[string]any{
+				{"number": 2, "state": "resolved", "resolution": "revoked", "secret": "dummy-sensitive-value",
+					"created_at": created.Format(time.RFC3339), "resolved_at": resolvedAt.Format(time.RFC3339)},
+				{"number": 3, "state": "resolved", "resolution": "false_positive", "secret": "dummy-sensitive-value",
+					"created_at": created.Format(time.RFC3339), "resolved_at": resolvedAt.Format(time.RFC3339)},
+				{"number": 4, "state": "resolved", "resolution": "pattern_edited", "secret": "dummy-sensitive-value",
+					"created_at": created.Format(time.RFC3339), "resolved_at": resolvedAt.Format(time.RFC3339)},
+			})
+		default:
+			writer.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	directory := t.TempDir()
+	store := evidenceFixtureStore(t, directory, nil)
+	scope := Scope{client.base.Hostname(), OrganizationScope, "fixture-org"}
+
+	result, _, err := FetchOrgSecretScanningAlerts(context.Background(), client, store, scope, "fixture-org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Complete || len(result.Observations) != 4 {
+		t.Fatalf("expected 4 pooled observations: %+v", result)
+	}
+	if walkErr := filepath.Walk(directory, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return err
+		}
+		raw, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		if strings.Contains(string(raw), "dummy-sensitive-value") {
+			t.Fatalf("the literal secret value must never survive sanitization: %s", path)
+		}
+		return nil
+	}); walkErr != nil {
+		t.Fatal(walkErr)
+	}
+
+	metrics, err := AlertLifecycleMetrics(result.Observations, created.Add(-180*24*time.Hour), created.Add(72*time.Hour), result.Complete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only the "revoked" resolution counts as fixed; "false_positive" is
+	// excluded from MTTR; "pattern_edited" is an unknown/unsupported
+	// resolution for this helper's contract and must make the whole MTTR
+	// metric unavailable rather than silently dropped or counted.
+	if metrics["mttr_days"].Status != MetricUnavailable {
+		t.Fatalf("an unrecognized resolution (pattern_edited) must make MTTR unavailable, not silently excluded: %+v", metrics["mttr_days"])
+	}
+}
+
+// TestFetchOrgCodeScanningAlertsThreeStatesPooled confirms open, dismissed
+// and fixed states are each fetched and pooled into one observation set.
+func TestFetchOrgCodeScanningAlertsThreeStatesPooled(t *testing.T) {
+	created := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		state := request.URL.Query().Get("state")
+		switch state {
+		case "open":
+			writeJSON(t, writer, []map[string]any{{"number": 1, "state": "open", "created_at": created.Format(time.RFC3339),
+				"rule": map[string]any{"security_severity_level": "critical"}}})
+		case "dismissed":
+			writeJSON(t, writer, []map[string]any{{"number": 2, "state": "dismissed", "created_at": created.Format(time.RFC3339),
+				"dismissed_reason": "won't fix"}})
+		case "fixed":
+			writeJSON(t, writer, []map[string]any{{"number": 3, "state": "fixed", "created_at": created.Format(time.RFC3339),
+				"fixed_at": created.Add(24 * time.Hour).Format(time.RFC3339)}})
+		default:
+			writer.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	scope := Scope{client.base.Hostname(), OrganizationScope, "fixture-org"}
+
+	result, outcomes, err := FetchOrgCodeScanningAlerts(context.Background(), client, store, scope, "fixture-org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outcomes) != 3 || !result.Complete || len(result.Observations) != 3 {
+		t.Fatalf("expected 3 pooled observations from 3 state fetches: %+v", result)
+	}
+}
+
+// TestFetchOrgCodeSecurityConfigurationsHostQualifiedIDsAndUnknownAttachment
+// confirms configuration IDs are matched per host (the same numeric ID on
+// two different hosts must not collide) and that a non-final attachment
+// status (still "updating") leaves coverage unavailable rather than
+// assuming disabled.
+func TestFetchOrgCodeSecurityConfigurationsHostQualifiedIDsAndUnknownAttachment(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/orgs/fixture-org/code-security/configurations":
+			writeJSON(t, writer, []map[string]any{
+				{"id": 1, "target_type": "organization", "enforcement": "enforced",
+					"secret_scanning": "enabled", "secret_scanning_push_protection": "enabled",
+					"dependabot_alerts": "enabled", "code_scanning_default_setup": "enabled"},
+				{"id": 2, "target_type": "organization", "enforcement": "unenforced",
+					"secret_scanning": "disabled", "secret_scanning_push_protection": "disabled",
+					"dependabot_alerts": "disabled", "code_scanning_default_setup": "disabled"},
+			})
+		case "/orgs/fixture-org/code-security/configurations/defaults":
+			writeJSON(t, writer, []map[string]any{})
+		case "/orgs/fixture-org/code-security/configurations/1/repositories":
+			writeJSON(t, writer, []map[string]any{
+				{"status": "enforced", "repository": map[string]any{"full_name": "fixture-org/repo-001"}},
+			})
+		case "/orgs/fixture-org/code-security/configurations/2/repositories":
+			writeJSON(t, writer, []map[string]any{
+				// Still transitioning; must not be assumed disabled.
+				{"status": "updating", "repository": map[string]any{"full_name": "fixture-org/repo-002"}},
+			})
+		default:
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	scope := Scope{client.base.Hostname(), OrganizationScope, "fixture-org"}
+
+	metric, _, err := FetchOrgCodeSecurityConfigurations(context.Background(), client, store, scope, "fixture-org",
+		[]string{"fixture-org/repo-001", "fixture-org/repo-002"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metric.Status != MetricUnavailable {
+		t.Fatalf("an in-flight (updating) attachment must leave coverage unavailable, not assumed disabled: %+v", metric)
+	}
+}
+
+// TestFetchOrgCodeSecurityConfigurationsFullFeatureOnly confirms a repository
+// attached to a configuration where only some required features are enabled
+// does not count toward the numerator (every required feature must be
+// enabled, not merely "attached").
+func TestFetchOrgCodeSecurityConfigurationsFullFeatureOnly(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/orgs/fixture-org/code-security/configurations":
+			writeJSON(t, writer, []map[string]any{
+				{"id": 9, "target_type": "organization", "enforcement": "enforced",
+					"secret_scanning": "enabled", "secret_scanning_push_protection": "disabled",
+					"dependabot_alerts": "enabled", "code_scanning_default_setup": "enabled"},
+			})
+		case "/orgs/fixture-org/code-security/configurations/defaults":
+			writeJSON(t, writer, []map[string]any{})
+		case "/orgs/fixture-org/code-security/configurations/9/repositories":
+			writeJSON(t, writer, []map[string]any{
+				{"status": "attached", "repository": map[string]any{"full_name": "fixture-org/repo-001"}},
+			})
+		default:
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	scope := Scope{client.base.Hostname(), OrganizationScope, "fixture-org"}
+
+	metric, _, err := FetchOrgCodeSecurityConfigurations(context.Background(), client, store, scope, "fixture-org", []string{"fixture-org/repo-001"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metric.Status != MetricKnown || metric.Number == nil || *metric.Number != 0 {
+		t.Fatalf("partial feature enablement (push protection disabled) must not count toward full coverage: %+v", metric)
+	}
+}
+
+// TestFetchRepositoryCodeScanningDefaultSetupUnknownOnConcealedResponse
+// confirms a forbidden/concealed default-setup probe reports unknown
+// (nil), never a false "disabled".
+func TestFetchRepositoryCodeScanningDefaultSetupUnknownOnConcealedResponse(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusForbidden)
+		writeJSON(t, writer, map[string]string{"message": "must have admin rights"})
+	}))
+	t.Cleanup(server.Close)
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	scope := Scope{client.base.Hostname(), RepositoryScope, "fixture-org/widget"}
+
+	configured, outcome, err := FetchRepositoryCodeScanningDefaultSetup(context.Background(), client, store, scope, "fixture-org", "widget")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configured != nil {
+		t.Fatalf("a forbidden probe must report unknown enablement, not a value: %v", *configured)
+	}
+	if outcome.Availability != MissingPermission {
+		t.Fatalf("expected the outcome to disclose the forbidden access: %+v", outcome)
+	}
+}
+
+// TestFetchRepositoryContentsProbeRecursiveTreeFindsNestedManifests confirms
+// manifest detection walks the full recursive tree (not root-only) and
+// correctly parses .github/dependabot.yml for grouped version updates and a
+// github-actions ecosystem entry.
+func TestFetchRepositoryContentsProbeRecursiveTreeFindsNestedManifests(t *testing.T) {
+	dependabotYAML := "version: 2\nupdates:\n  - package-ecosystem: \"npm\"\n    directory: \"/\"\n    schedule:\n      interval: \"weekly\"\n    groups:\n      dev-dependencies:\n        patterns: [\"*\"]\n  - package-ecosystem: \"github-actions\"\n    directory: \"/\"\n    schedule:\n      interval: \"weekly\"\n"
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/repos/fixture-org/widget/git/trees/main":
+			writeJSON(t, writer, map[string]any{
+				"sha": "abc", "truncated": false,
+				"tree": []map[string]any{
+					{"path": "README.md", "type": "blob"},
+					{"path": "services/api/go.mod", "type": "blob"},
+					{"path": "services/api/go.sum", "type": "blob"},
+					{"path": "ui/package.json", "type": "blob"},
+					{"path": "ui", "type": "tree"},
+				},
+			})
+		case "/repos/fixture-org/widget/contents/.github/dependabot.yml":
+			writeJSON(t, writer, map[string]any{
+				"type": "file", "encoding": "base64", "name": "dependabot.yml",
+				"content": base64.StdEncoding.EncodeToString([]byte(dependabotYAML)),
+			})
+		default:
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	scope := Scope{client.base.Hostname(), RepositoryScope, "fixture-org/widget"}
+
+	result, outcomes, err := FetchRepositoryContentsProbe(context.Background(), client, store, scope, "fixture-org", "widget", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outcomes) != 2 || result.UsedRootOnlyFallback {
+		t.Fatalf("expected the recursive tree path (no fallback): %+v %+v", result, outcomes)
+	}
+	if result.SupportedManifestCount != 3 {
+		t.Fatalf("expected the nested manifests (go.mod, go.sum, package.json) found, not just root-level files: %+v", result.ManifestPaths)
+	}
+	if !result.DependabotConfigKnown || !result.HasGroupedVersionUpdate || !result.HasActionsEcosystem {
+		t.Fatalf("expected dependabot.yml to be parsed with groups and a github-actions ecosystem entry: %+v", result)
+	}
+}
+
+// TestFetchRepositoryContentsProbeTruncatedTreeFallsBackToRootOnly confirms a
+// truncated recursive tree response is explicitly flagged, not silently
+// presented as an exhaustive inventory.
+func TestFetchRepositoryContentsProbeTruncatedTreeFallsBackToRootOnly(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/repos/fixture-org/widget/git/trees/main":
+			writeJSON(t, writer, map[string]any{"sha": "abc", "truncated": true, "tree": []map[string]any{}})
+		case "/repos/fixture-org/widget/contents":
+			writeJSON(t, writer, []map[string]any{
+				{"name": "go.mod", "type": "file"}, {"name": "README.md", "type": "file"},
+			})
+		case "/repos/fixture-org/widget/contents/.github/dependabot.yml":
+			writer.WriteHeader(http.StatusNotFound)
+		default:
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	scope := Scope{client.base.Hostname(), RepositoryScope, "fixture-org/widget"}
+
+	result, _, err := FetchRepositoryContentsProbe(context.Background(), client, store, scope, "fixture-org", "widget", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.UsedRootOnlyFallback || !result.Complete {
+		t.Fatalf("expected a truncated tree to fall back to root-only, explicitly flagged: %+v", result)
+	}
+	if result.SupportedManifestCount != 1 {
+		t.Fatalf("expected the root-level go.mod to be found: %+v", result.ManifestPaths)
+	}
+	if result.DependabotConfigFound || result.DependabotConfigKnown {
+		t.Fatalf("a 404 on dependabot.yml must leave config-known false, not a confirmed absence used as a known 'no groups': %+v", result)
+	}
+}

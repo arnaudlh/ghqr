@@ -120,6 +120,16 @@ func preflightWithStore(ctx context.Context, profile *Profile, targets []Target,
 			if len(item.Outcomes) == 0 {
 				item.Reason = "no applicable explicit scope object; no access probe attempted"
 			}
+		} else if importContractCollectorIDSet[collector.ID] {
+			// These collectors have no live API/probe surface at all (customer-
+			// run CLI/SSH output, Management Console screenshots, external
+			// status feeds or assessor interviews/documents). Readiness is
+			// explicitly ImportOnly, never Ready (no probe was or could be
+			// attempted) and never the default Unimplemented reason (which
+			// would wrongly suggest a future API probe is expected here).
+			item.Readiness = ImportOnly
+			item.Reason = "no live API surface exists for this collector; it accepts only an explicitly supplied, " +
+				"schema-validated import payload (see ValidateImportContractPayload) and is never auto-probed"
 		}
 		report.Collectors = append(report.Collectors, item)
 	}
@@ -161,6 +171,18 @@ func ImportJSON(profile *Profile, config *CustomerConfig, raw []byte, metadata E
 	}
 	if err := authorizeEvidenceScope(config, metadata.Scope); err != nil {
 		return EvidenceRef{}, err
+	}
+	// A recognized import-contract collector ID (ghes.cli/ghes.backup, every
+	// ui.*/ext.* capture, manual.interview/manual.document) must satisfy its
+	// typed, schema-validated shape before any evidence store is even
+	// opened: these 16 collector IDs have no live API surface at all, so
+	// this import is their ONLY acceptance gate. An ordinary scoped-API
+	// collector ID (anything outside this 16-member set) is unaffected and
+	// keeps accepting any well-scoped JSON payload exactly as before.
+	if importContractCollectorIDSet[metadata.CollectorID] {
+		if _, err := ValidateImportContractPayload(metadata.CollectorID, raw); err != nil {
+			return EvidenceRef{}, fmt.Errorf("import payload for %q failed its contract validation: %w", metadata.CollectorID, err)
+		}
 	}
 	metadata.SourceKind = ImportedEvidence
 	store, err := OpenEvidenceStore(config.EvidenceDir, NewRedactor())

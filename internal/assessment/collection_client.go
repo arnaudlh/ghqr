@@ -219,6 +219,97 @@ func (c *CollectionClient) CollectGET(ctx context.Context, store *EvidenceStore,
 	return outcome, nil
 }
 
+// CollectGraphQL executes a single read-only GraphQL query (the shared read
+// transport independently re-validates it is a read-only, single-operation
+// query before it ever reaches the network) and stores its sanitized
+// response as one evidence object. Unlike CollectGET, GraphQL has no REST
+// Link-header pagination: a query needing more results than fits in one
+// response uses a larger first/last value or a follow-up query with an
+// explicit cursor variable, which is a caller concern, not this method's.
+// The CollectionClient must have been constructed with GraphQLEvidence; its
+// relative request path is derived from the shared read transport's
+// configured graphQLPath ("graphql" for Cloud, "api/graphql" for Server), not
+// hardcoded here, so Cloud/Server routing stays centralized in one place.
+func (c *CollectionClient) CollectGraphQL(ctx context.Context, store *EvidenceStore, scope Scope, collectorID, feature, query string,
+	variables map[string]any) (CollectorOutcome, []byte, error) {
+	outcome := CollectorOutcome{
+		CollectorID: collectorID, Feature: feature, Scope: scope, Readiness: Ready,
+		Availability: NotChecked, Status: NotRun, CredentialKind: c.credentialKind, EvidenceRefs: []string{},
+	}
+	if store == nil {
+		return outcome, nil, fmt.Errorf("collection requires an evidence store")
+	}
+	if c.source != GraphQLEvidence {
+		return outcome, nil, fmt.Errorf("CollectGraphQL requires a GraphQL-sourced collection client")
+	}
+	if err := validateEvidenceIdentity(scope, collectorID, feature); err != nil {
+		return outcome, nil, err
+	}
+	if scope.Host != c.base.Hostname() && "api."+scope.Host != c.base.Hostname() {
+		return outcome, nil, fmt.Errorf("collection scope is outside its host credential route")
+	}
+	transport, ok := c.http.Transport.(*readTransport)
+	if !ok || transport.graphQLPath == "" {
+		return outcome, nil, fmt.Errorf("GraphQL collection client is missing its configured query path")
+	}
+	sdk := github.NewClient(c.http)
+	sdk.BaseURL = c.base
+	body := map[string]any{"query": query, "variables": variables}
+	request, err := sdk.NewRequest(http.MethodPost, strings.TrimPrefix(transport.graphQLPath, "/"), body)
+	if err != nil {
+		outcome.Status = CollectionFailed
+		outcome.Reason = "GraphQL request could not be constructed"
+		return outcome, nil, fmt.Errorf("construct GraphQL collection request")
+	}
+	request.Header.Set("X-GitHub-Api-Version", c.profile.APIVersionHeader)
+	request.Header.Set("Accept", "application/vnd.github+json")
+	capture := &requestCapture{}
+	requestCtx := context.WithValue(ctx, captureContextKey{}, capture)
+	var buffer bytes.Buffer
+	_, requestErr := sdk.Do(requestCtx, request, &buffer)
+	if capture.status == 0 {
+		outcome.Status = CollectionFailed
+		outcome.Reason = "request failed before an HTTP response was observed"
+		return outcome, nil, fmt.Errorf("GraphQL collection request failed without an HTTP response")
+	}
+	status := capture.status
+	outcome.HTTPStatus = &status
+	outcome.Availability = responseAvailability(status, capture.body)
+	if capture.rateLimited {
+		outcome.Availability = RateLimited
+	}
+	clean, redactions, err := c.redactor.JSON(capture.body)
+	if err != nil {
+		outcome.Status = CollectionFailed
+		outcome.Reason = "response is not supported structured JSON evidence"
+		return outcome, nil, err
+	}
+	complete := requestErr == nil && status >= 200 && status < 300
+	metadata := EvidenceMetadata{
+		SchemaVersion: "1", ProfileVersion: c.profile.Version, ProfileSHA256: c.profile.SHA256,
+		CollectorID: collectorID, Feature: pageFeatureName(feature, 1),
+		Scope: scope, CollectedAt: c.clock.Now(), Endpoint: c.redactor.Text(capture.endpoint),
+		SourceKind: c.source, APIVersion: c.profile.APIVersionHeader,
+		CredentialKind: c.credentialKind, HTTPStatus: &status, Pages: 1, Complete: complete, Redactions: redactions,
+	}
+	ref, err := store.SaveJSON(clean, metadata)
+	if err != nil {
+		outcome.Status = CollectionFailed
+		outcome.Reason = "sanitized evidence could not be persisted"
+		return outcome, nil, err
+	}
+	outcome.Pages = 1
+	outcome.EvidenceRefs = append(outcome.EvidenceRefs, ref.DataPath, ref.MetadataPath)
+	if !complete {
+		outcome.Status = CollectionPartial
+		outcome.Reason = "the query failed access or returned a non-2xx response"
+		return outcome, clean, fmt.Errorf("GraphQL collection is incomplete (HTTP %d)", status)
+	}
+	outcome.Status = CollectionOK
+	outcome.Complete = true
+	return outcome, clean, nil
+}
+
 func responseAvailability(status int, raw []byte) Availability {
 	response := &http.Response{StatusCode: status, Header: http.Header{}}
 	if assessmentRateLimited(response, raw) {

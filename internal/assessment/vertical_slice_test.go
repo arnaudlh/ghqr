@@ -87,7 +87,7 @@ func TestRunVerticalSliceEndToEndSyntheticOrganization(t *testing.T) {
 	}
 
 	report, err := runVerticalSliceWithStore(context.Background(), client.profile, config, []Target{target}, store, SystemClock{},
-		func(Target) (*CollectionClient, error) { return client, nil })
+		func(Target, EvidenceSource) (*CollectionClient, error) { return client, nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestRunVerticalSliceSamplesWhenActivePopulationExceedsCap(t *testing.T) {
 	}
 
 	report, err := runVerticalSliceWithStore(context.Background(), client.profile, config, []Target{target}, store, SystemClock{},
-		func(Target) (*CollectionClient, error) { return client, nil })
+		func(Target, EvidenceSource) (*CollectionClient, error) { return client, nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,5 +174,92 @@ func TestRunVerticalSliceSamplesWhenActivePopulationExceedsCap(t *testing.T) {
 	}
 	if len(report.Organizations[0].Repositories) != 1 {
 		t.Fatalf("analysis did not respect the sampled eligible set: %d repositories analyzed", len(report.Organizations[0].Repositories))
+	}
+}
+
+// TestRunVerticalSliceWiresEnterpriseInfoAndGHESManageBasics confirms the
+// run loop constructs an additional GraphQL-sourced and Management-sourced
+// CollectionClient (sharing the same request budget) per target and
+// populates report.Targets, exactly once per target rather than once per
+// organization.
+func TestRunVerticalSliceWiresEnterpriseInfoAndGHESManageBasics(t *testing.T) {
+	restServer := newVerticalSliceFixtureServer(t)
+	budget := fixtureBudget(t)
+	restClient := collectionFixtureClient(t, restServer, budget, SystemClock{})
+
+	graphQLServer := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/graphql" || request.Method != http.MethodPost {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"enterprise": map[string]any{
+			"name": "Fixture Enterprise", "slug": "fixture-enterprise",
+			"organizations": map[string]any{"totalCount": 1, "nodes": []map[string]any{{"login": "fixture-org"}}},
+			"ownerInfo":     map[string]any{"admins": map[string]any{"totalCount": 1, "nodes": []map[string]any{{"login": "octocat"}}}},
+		}}})
+	}))
+	t.Cleanup(graphQLServer.Close)
+	graphQLClient := graphQLFixtureClient(t, graphQLServer, budget, SystemClock{})
+
+	manageServer := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/manage/v1/version":
+			writeJSON(t, writer, map[string]any{"version": "3.18.0"})
+		default:
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(manageServer.Close)
+	manageClient := managementFixtureClient(t, manageServer, budget, SystemClock{}, "admin", "fixture-password")
+
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	target := Target{
+		Host: restClient.base.Hostname(), Deployment: Server, Enterprise: "fixture-enterprise", Organizations: []string{"fixture-org"},
+	}
+	config, err := ParseConfig([]byte("organizations: [fixture-org]\ndeployment: ghes\nghes_host: " + restClient.base.Hostname() + "\nrepository_cap: 10\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	graphQLCalls, manageCalls := 0, 0
+	report, err := runVerticalSliceWithStore(context.Background(), restClient.profile, config, []Target{target}, store, SystemClock{},
+		func(_ Target, source EvidenceSource) (*CollectionClient, error) {
+			switch source {
+			case GraphQLEvidence:
+				graphQLCalls++
+				return graphQLClient, nil
+			case ManagementEvidence:
+				manageCalls++
+				return manageClient, nil
+			default:
+				return restClient, nil
+			}
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if graphQLCalls != 1 || manageCalls != 1 {
+		t.Fatalf("expected exactly one GraphQL and one Management client built per target, got %d/%d", graphQLCalls, manageCalls)
+	}
+	if len(report.Targets) != 1 || report.Targets[0].EnterpriseInfo == nil || report.Targets[0].GHESManageBasics == nil {
+		t.Fatalf("expected one target result with both enterprise info and GHES manage basics populated: %+v", report.Targets)
+	}
+	if report.Targets[0].EnterpriseInfo.Slug != "fixture-enterprise" || report.Targets[0].EnterpriseInfo.OrganizationCount != 1 {
+		t.Fatalf("unexpected enterprise info: %+v", report.Targets[0].EnterpriseInfo)
+	}
+	if !report.Targets[0].GHESManageBasics.VersionAvailable {
+		t.Fatalf("expected the GHES manage version probe to succeed: %+v", report.Targets[0].GHESManageBasics)
+	}
+
+	// Spot-check a sample of the new exact-profile-key metrics this phase
+	// adds are present (even if unavailable, given this fixture server does
+	// not serve every new org-level endpoint) rather than silently absent.
+	for _, key := range []string{
+		"custom_apps_count", "hooks_without_secret_pct", "fine_grained_pat_grants_count", "pending_pat_requests",
+		"owner_count", "members_without_2fa", "review_coverage_pct", "ci_success_rate_90d",
+	} {
+		if _, ok := report.Metrics[key]; !ok {
+			t.Errorf("expected metric key %q to be present in the run's measured metrics", key)
+		}
 	}
 }
