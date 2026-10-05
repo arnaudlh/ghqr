@@ -110,6 +110,8 @@ type EvidenceMetadata struct {
 	Scope          Scope          `json:"scope"`
 	CollectedAt    time.Time      `json:"collected_at"`
 	Endpoint       string         `json:"endpoint"`
+	SourceKind     EvidenceSource `json:"source_kind"`
+	APIVersion     string         `json:"api_version"`
 	CredentialKind CredentialKind `json:"credential_kind"`
 	HTTPStatus     *int           `json:"http_status"`
 	Pages          int            `json:"pages"`
@@ -123,15 +125,18 @@ type EvidenceMetadata struct {
 
 // CollectorOutcome is scoped to a host, collector and feature, not a whole token.
 type CollectorOutcome struct {
-	CollectorID  string        `json:"collector_id"`
-	Feature      string        `json:"feature"`
-	Scope        Scope         `json:"scope"`
-	Readiness    Readiness     `json:"readiness"`
-	Availability Availability  `json:"availability"`
-	Status       OutcomeStatus `json:"status"`
-	HTTPStatus   *int          `json:"http_status"`
-	EvidenceRefs []string      `json:"evidence_refs"`
-	Reason       string        `json:"reason"`
+	CollectorID    string         `json:"collector_id"`
+	Feature        string         `json:"feature"`
+	Scope          Scope          `json:"scope"`
+	Readiness      Readiness      `json:"readiness"`
+	Availability   Availability   `json:"availability"`
+	Status         OutcomeStatus  `json:"status"`
+	HTTPStatus     *int           `json:"http_status"`
+	CredentialKind CredentialKind `json:"credential_kind"`
+	Pages          int            `json:"pages"`
+	Complete       bool           `json:"complete"`
+	EvidenceRefs   []string       `json:"evidence_refs"`
+	Reason         string         `json:"reason"`
 }
 
 // MetricStatus distinguishes known values from unavailable or inapplicable data.

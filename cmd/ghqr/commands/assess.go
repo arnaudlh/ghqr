@@ -61,7 +61,7 @@ func newAssessCommand() *cobra.Command {
 			return nil
 		},
 	})
-	for _, operation := range []string{"preflight", "run"} {
+	for _, operation := range []string{"run"} {
 		command.AddCommand(&cobra.Command{
 			Use: operation, Short: "Not implemented; returns an explicit error without network access",
 			Args: cobra.NoArgs,
@@ -70,5 +70,6 @@ func newAssessCommand() *cobra.Command {
 			},
 		})
 	}
+	addAssessmentCollectionCommands(command, &profilePath, &configPath)
 	return command
 }

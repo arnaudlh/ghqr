@@ -1,9 +1,9 @@
 # Evidence-backed Well-Architected assessment
 
-**Status: Phase 1 is locally complete and verified; publication is pending.**
+**Status: Phase 1 is complete and published; Phase 2 is locally verified.**
 The exact profile is embedded in the binary, and default offline commands work
 outside the checkout. Collection, scoring and later phases are not implemented.
-There are currently zero implemented collectors and zero control evaluators;
+There are currently two implemented collectors (`org.settings`, `ghes.meta`) and zero control evaluators;
 catalogue counts are not completion counts. This workflow is separate from
 `ghqr scan`; it does not reinterpret legacy recommendation descriptors as
 Well-Architected controls.
@@ -63,12 +63,13 @@ remains explicit so an offline plan cannot imply consent to discover targets.
 
 `profile` validates exact local IDs, origins, automation counts and collector
 references and prints a JSON catalogue summary. `plan` prints an **offline plan**:
-all 67 collectors are `unimplemented` with availability `not-checked`, all metrics
+all 67 collectors have availability `not-checked` (two have registered implementations), all metrics
 are unavailable with reasons, and applicable controls are `NOT_ASSESSED`.
 Neither command resolves credentials, contacts GitHub or produces raw evidence.
 
-`ghqr assess preflight` and `ghqr assess run` currently return explicit
-not-implemented errors. An offline plan is not `feasibility.json`, a successful
+`ghqr assess preflight` requires explicit `--live` consent and probes only the two
+registered collectors on explicitly configured scope objects. `ghqr assess run`
+is not implemented yet. An offline plan is not `feasibility.json`, a successful
 preflight, a collection run or a scored assessment. `ghqr assess` is the planned
 repository-native counterpart of the brief's `waf-collect`; legacy scan, replay
 and MCP behavior remains independent.

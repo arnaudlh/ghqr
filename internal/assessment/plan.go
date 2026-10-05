@@ -43,9 +43,16 @@ func BuildPlan(profile *Profile, config *CustomerConfig) (*Plan, error) {
 		Metrics: map[string]Metric{}, Thresholds: config.Thresholds,
 	}
 	for _, collector := range profile.Collectors {
+		readiness := Unimplemented
+		reason := "collector and import contracts are not implemented; access has not been probed"
+		for _, implemented := range ImplementedCollectorIDs() {
+			if collector.ID == implemented {
+				readiness = Ready
+				reason = "collector implementation is registered; access has not been probed by this offline plan"
+			}
+		}
 		plan.Collectors = append(plan.Collectors, CollectorPlan{
-			CollectorID: collector.ID, Readiness: Unimplemented, Availability: NotChecked,
-			Reason: "collector and import contracts are not implemented; access has not been probed",
+			CollectorID: collector.ID, Readiness: readiness, Availability: NotChecked, Reason: reason,
 		})
 	}
 	for _, control := range profile.Controls {

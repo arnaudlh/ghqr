@@ -19,7 +19,13 @@ func TestOfflinePlanDoesNotClaimCollectionOrScores(t *testing.T) {
 		t.Fatalf("incomplete offline plan: %s %d %d", plan.Kind, len(plan.Collectors), len(plan.Results))
 	}
 	for _, collector := range plan.Collectors {
-		if collector.Readiness != Unimplemented || collector.Availability != NotChecked || collector.Reason == "" {
+		expectedReadiness := Unimplemented
+		for _, implemented := range ImplementedCollectorIDs() {
+			if collector.CollectorID == implemented {
+				expectedReadiness = Ready
+			}
+		}
+		if collector.Readiness != expectedReadiness || collector.Availability != NotChecked || collector.Reason == "" {
 			t.Fatalf("plan invented collector feasibility: %+v", collector)
 		}
 	}

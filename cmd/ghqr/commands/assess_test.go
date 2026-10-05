@@ -26,7 +26,7 @@ func TestAssessCommandDiscovery(t *testing.T) {
 }
 
 func TestAssessmentUnimplementedOperationsFailExplicitly(t *testing.T) {
-	for _, operation := range []string{"preflight", "run"} {
+	for _, operation := range []string{"run"} {
 		t.Run(operation, func(t *testing.T) {
 			command := newAssessCommand()
 			var output bytes.Buffer
