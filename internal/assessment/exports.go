@@ -11,6 +11,7 @@ import (
 	"html"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -74,12 +75,21 @@ func RenderInterviewGuide(profile *Profile, results []ControlResult) ([]byte, er
 						control.ID, control.Automation, exportMarkdown(*control.InterviewQuestion))
 					fmt.Fprintf(&output, "Proposed state: %s. %s\n\n",
 						result.ProposedState, exportMarkdown(result.Notes))
+					if result.Discussion == nil {
+						output.WriteString("Discussion answer: Pending. No respondent, date or discussion evidence supplied.\n\n")
+					} else {
+						answer := result.Discussion
+						fmt.Fprintf(&output, "Discussion answer: %s\n\nRespondent: %s. Date: %s. Discussion evidence: %s.\n\n",
+							exportMarkdown(answer.Answer), exportMarkdown(answer.Respondent), answer.AnsweredAt.Format(time.RFC3339),
+							exportMarkdown(strings.Join(answer.EvidenceRefs, "; ")))
+						output.WriteString("A recorded answer is not assessor confirmation and does not change the GitHub-facts proposal.\n\n")
+					}
 					if control.Automation == Partial || control.ID == "PRD-041" {
 						metrics, err := json.MarshalIndent(result.Metrics, "", "  ")
 						if err != nil {
 							return nil, fmt.Errorf("encode interview metrics for %s: %w", control.ID, err)
 						}
-						output.WriteString("Computed metrics (including explicit unavailable values):\n\n")
+						output.WriteString("GitHub facts: Computed metrics (including explicit unavailable values):\n\n")
 						for _, line := range strings.Split(string(metrics), "\n") {
 							fmt.Fprintf(&output, "    %s\n", line)
 						}
@@ -152,6 +162,15 @@ func RenderAssessmentSummary(profile *Profile, results []ControlResult, outcomes
 	output.WriteString("# Assessment summary\n\n")
 	fmt.Fprintf(&output, "Profile: %s. Source digest: %s.\n\n", exportMarkdown(profile.Version), exportMarkdown(profile.SHA256))
 	output.WriteString("Counts below describe proposed states, not certification or proof that unobserved controls are implemented.\n\n")
+	answered := 0
+	for _, result := range results {
+		if result.Discussion != nil {
+			answered++
+		}
+	}
+	fmt.Fprintf(&output, "Two separate inputs: saved GitHub settings/activity provide the automatic proposals; "+
+		"%d recorded discussion answers provide human context (see interview-guide.md). Missing answers stay pending. "+
+		"An answer alone never confirms a control or turns missing GitHub evidence into a pass.\n\n", answered)
 	output.WriteString("| Pillar / design principle | IMPLEMENTED | PARTIAL | NOT_IMPLEMENTED | N/A | NOT_ASSESSED |\n")
 	output.WriteString("| --- | ---: | ---: | ---: | ---: | ---: |\n")
 	for _, pillar := range exportPillars(profile) {

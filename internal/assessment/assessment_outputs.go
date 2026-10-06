@@ -4,6 +4,7 @@
 package assessment
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -536,10 +537,10 @@ func ApplyConfirmationsAndReexport(profile *Profile, config *CustomerConfig, out
 // claimed metric no corresponding collector evidence actually supports);
 // Verified is true only when both hold.
 type EvidenceVerificationResult struct {
-	EvidenceDirectory string   `json:"evidence_directory"`
-	OutcomesChecked   int      `json:"outcomes_checked"`
-	PagesVerified     int      `json:"pages_verified"`
-	IntegrityVerified bool     `json:"integrity_verified"`
+	EvidenceDirectory string `json:"evidence_directory"`
+	OutcomesChecked   int    `json:"outcomes_checked"`
+	PagesVerified     int    `json:"pages_verified"`
+	IntegrityVerified bool   `json:"integrity_verified"`
 	// ContextBound is true when evidenceDirectory carried a genuine,
 	// immutable RunCollectionContext (see run_collection_context.go) that
 	// AnalysisVerified's replay reconstruction was bound to directly, and
@@ -764,6 +765,29 @@ func RunVerifiedOfflineEvaluation(profile *Profile, report *VerticalSliceReport,
 	}
 	if evidenceDirectory == "" {
 		return runOfflineEvaluationCore(profile, report, config, outputDirectory, VerificationModeTrustedCaller, nil)
+	}
+	if config.CheckDefinitions != nil {
+		if report.ContextRef != "" {
+			if err := validateExtractionContract(profile, report, evidenceDirectory, config.CheckDefinitions); err != nil {
+				return nil, err
+			}
+		} else {
+			defaults, err := LoadSimpleChecks(profile, "")
+			if err != nil {
+				return nil, err
+			}
+			original, err := json.Marshal(defaults.Extractions)
+			if err != nil {
+				return nil, fmt.Errorf("encode legacy extraction definition: %w", err)
+			}
+			selected, err := json.Marshal(config.CheckDefinitions.Extractions)
+			if err != nil {
+				return nil, fmt.Errorf("encode selected extraction definition: %w", err)
+			}
+			if !bytes.Equal(original, selected) {
+				return nil, fmt.Errorf("a legacy run without a bound extraction definition cannot accept a changed extraction")
+			}
+		}
 	}
 	result, err := VerifyReportEvidence(profile, report, evidenceDirectory)
 	if err != nil {

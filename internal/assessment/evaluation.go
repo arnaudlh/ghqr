@@ -8,6 +8,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 )
 
 // EvaluationInput is the full, already-collected evidence surface available to
@@ -20,6 +21,7 @@ type EvaluationInput struct {
 	Report     *VerticalSliceReport
 	Targets    []Target
 	Thresholds map[string]float64
+	Checks     *SimpleChecks
 }
 
 // EvaluatorFunc produces one control's typed, deterministic proposed result
@@ -88,7 +90,17 @@ func EvaluateReport(profile *Profile, report *VerticalSliceReport, config *Custo
 	if err != nil {
 		return nil, fmt.Errorf("resolve evaluation targets: %w", err)
 	}
-	input := &EvaluationInput{Profile: profile, Report: report, Targets: targets, Thresholds: config.Thresholds}
+	checks := config.CheckDefinitions
+	if checks == nil {
+		checks, err = LoadSimpleChecks(profile, "")
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := checks.Validate(profile); err != nil {
+		return nil, fmt.Errorf("validate evaluation checks: %w", err)
+	}
+	input := &EvaluationInput{Profile: profile, Report: report, Targets: targets, Thresholds: config.Thresholds, Checks: checks}
 
 	results := make([]ControlResult, 0, len(profile.Controls))
 	for _, control := range profile.Controls {
@@ -105,7 +117,16 @@ func EvaluateReport(profile *Profile, report *VerticalSliceReport, config *Custo
 			continue
 		}
 		if evaluator, ok := evaluatorRegistry[control.ID]; ok {
-			results = append(results, evaluator(control, input))
+			result := evaluator(control, input)
+			if control.ID == "SEC-043" && config.CheckDefinitions != nil {
+				extraction := config.CheckDefinitions.Extractions[0]
+				result.RuleDefinitionSHA256 = config.CheckDefinitions.SHA256
+				result.Notes += fmt.Sprintf(" Configuration-fact source: %s%s (%s); enabled %s %v. "+
+					"Explicit extraction policy SHA-256 %s; population/eligibility calculations remain separate.",
+					extraction.CollectorID, extraction.FieldPath, extraction.Type, extraction.Enabled.Operator,
+					extraction.Enabled.ExpectedValues, config.CheckDefinitions.SHA256)
+			}
+			results = append(results, result)
 			continue
 		}
 		base.Notes = unimplementedReason(control, keys, report)
@@ -114,7 +135,7 @@ func EvaluateReport(profile *Profile, report *VerticalSliceReport, config *Custo
 		}
 		results = append(results, base)
 	}
-	return results, nil
+	return ApplyInterviewAnswers(profile, results, config.InterviewAnswers, time.Now().UTC())
 }
 
 // metricForUnimplementedControl preserves data separately from score: a
@@ -689,24 +710,7 @@ func evaluateARC005(control Control, input *EvaluationInput) ControlResult {
 	result.EvidenceRefs = overall.EvidenceRefs
 	result.Flags = append(result.Flags, verifyEndpointFlag(input.Profile, repoRulesCollectors...)...)
 
-	implementedFloor, overridden := effectiveImplementedFloor(input.Thresholds, "repos_with_default_branch_protection_pct", 90)
-	if overall.Status != MetricKnown {
-		result.ProposedState, result.Confidence = NotAssessed, LowConfidence
-		result.Notes = "NOT_ASSESSED: " + overall.Reason
-		return result
-	}
-	value := *overall.Number
-	result.ProposedState = thresholdTier(value, 60, implementedFloor)
-	result.Confidence = confidenceFor(value, 60, implementedFloor, pool.incomplete == 0, anySampled(input.Report))
-	overrideNote := ""
-	if overridden {
-		overrideNote = fmt.Sprintf(" (customer-accepted threshold override: implemented floor is %.1f%%, not the profile default 90%%)", implementedFloor)
-	}
-	result.Notes = fmt.Sprintf(
-		"Measured %.1f%% (%d/%d) of analyzed active repositories with effective default-branch protection requiring a "+
-			"pull request and blocking force pushes; thresholds: >=%.1f%% implemented%s, 60-%.1f%% partial, below not implemented.",
-		value, pool.numerator, pool.denominator, implementedFloor, overrideNote, implementedFloor)
-	return result
+	return evaluateSimpleCheck(control, input, result, pool.incomplete == 0)
 }
 
 // evaluateGOV001 implements: "Data: active org rulesets targeting default
@@ -732,27 +736,7 @@ func evaluateGOV001(control Control, input *EvaluationInput) ControlResult {
 	result.Metrics["active_org_rulesets_count"] = reportedMetric(input.Report, "active_org_rulesets_count", input.Targets)
 	result.EvidenceRefs = refs
 
-	if overall.Status != MetricKnown {
-		result.ProposedState, result.Confidence = NotAssessed, LowConfidence
-		result.Notes = "NOT_ASSESSED pending confirmation: " + overall.Reason +
-			" This control is Partial automation and always requires assessor confirmation regardless of proposed state."
-		return result
-	}
-	value := *overall.Number
-	implementedFloor, overridden := effectiveImplementedFloor(input.Thresholds, "repos_with_default_branch_protection_pct", 90)
-	result.ProposedState = thresholdTier(value, 60, implementedFloor)
-	result.Confidence = confidenceFor(value, 60, implementedFloor, pool.incomplete == 0, anySampled(input.Report))
-	overrideNote := ""
-	if overridden {
-		overrideNote = fmt.Sprintf(" (customer-accepted threshold override: implemented floor is %.1f%%, not the profile default 90%%)", implementedFloor)
-	}
-	result.Notes = fmt.Sprintf(
-		"Proposed from measured %.1f%% (%d/%d) of analyzed active repositories with effective default-branch protection; "+
-			"thresholds: >=%.1f%% implemented%s, 60-%.1f%% partial. This control's interview half (whether teams can explain "+
-			"ruleset intent and ownership) is not observable by any collector and is never assumed satisfied; the "+
-			"mandatory assessor confirmation for this Partial control must evaluate it before this proposal can finalize.",
-		value, pool.numerator, pool.denominator, implementedFloor, overrideNote, implementedFloor)
-	return result
+	return evaluateSimpleCheck(control, input, result, pool.incomplete == 0)
 }
 
 // evaluateCOL027 implements: "Data: teams count, nested teams, team-vs-direct

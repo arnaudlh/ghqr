@@ -639,6 +639,12 @@ func ReplayVerticalSlice(ctx context.Context, profile *Profile, report *Vertical
 		}
 		targets = targetsFromContext(runContext)
 		config = configFromContext(runContext, targets)
+		if len(runContext.CheckDefinitions) > 0 {
+			config.CheckDefinitions, err = ParseSimpleChecks(profile, runContext.CheckDefinitions)
+			if err != nil {
+				return nil, true, fmt.Errorf("load captured configuration extraction definitions: %w", err)
+			}
+		}
 		at = runContext.CollectedAt
 	} else {
 		targets = legacyDeriveReplayTargets(report)

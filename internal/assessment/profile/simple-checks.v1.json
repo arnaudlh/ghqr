@@ -1,0 +1,34 @@
+{
+  "schema_version": "1",
+  "profile_version": "2.0",
+  "extractions": [
+    {
+      "collector_id": "repo.details",
+      "fact": "dependency_operational",
+      "field_path": "/security_and_analysis/dependabot_security_updates/status",
+      "type": "string",
+      "known_values": ["enabled", "disabled"],
+      "enabled": {"operator": "eq", "expected_values": ["enabled"]}
+    }
+  ],
+  "checks": [
+    {
+      "control_id": "ARC-005",
+      "question_ref": "ARC-005",
+      "metric_key": "repos_with_default_branch_protection_pct",
+      "field_path": "/overall/number",
+      "type": "number",
+      "implemented": {"operator": "gte", "expected_values": [90]},
+      "partial": {"operator": "gte", "expected_values": [60]}
+    },
+    {
+      "control_id": "GOV-001",
+      "question_ref": "GOV-001",
+      "metric_key": "repos_with_default_branch_protection_pct",
+      "field_path": "/overall/number",
+      "type": "number",
+      "implemented": {"operator": "gte", "expected_values": [90]},
+      "partial": {"operator": "gte", "expected_values": [60]}
+    }
+  ]
+}

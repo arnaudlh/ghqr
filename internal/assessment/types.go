@@ -347,6 +347,8 @@ type ControlResult struct {
 	Metrics              map[string]Metric `json:"metrics"`
 	EvidenceRefs         []string          `json:"evidence_refs"`
 	Notes                string            `json:"notes"`
+	RuleDefinitionSHA256 string            `json:"rule_definition_sha256,omitempty"`
+	Discussion           *InterviewAnswer  `json:"discussion,omitempty"`
 	Decision             *AssessorDecision `json:"assessor_decision,omitempty"`
 }
 

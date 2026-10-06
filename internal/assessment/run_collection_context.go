@@ -127,6 +127,7 @@ type RunCollectionContext struct {
 	// bind; such a context simply has nothing to compare/report from this
 	// mechanism, never treated as a tampered absence.
 	OriginalOutcomes []CollectorOutcome `json:"original_outcomes,omitempty"`
+	CheckDefinitions []byte             `json:"check_definitions,omitempty"`
 	ContentSHA256    string             `json:"content_sha256"`
 }
 
@@ -169,6 +170,12 @@ func buildRunCollectionContext(profile *Profile, config *CustomerConfig, targets
 		LookbackDays: config.LookbackDays, CriticalProperty: criticalProperty,
 		CriticalValues: append([]string{}, config.CriticalValues...), ProductionEnvRegex: config.ProductionEnvRegex,
 		OriginalOutcomes: append([]CollectorOutcome{}, originalOutcomes...),
+	}
+	if config.CheckDefinitions != nil {
+		if err := config.CheckDefinitions.Validate(profile); err != nil {
+			return RunCollectionContext{}, err
+		}
+		context.CheckDefinitions = append([]byte{}, config.CheckDefinitions.sourceJSON...)
 	}
 	digest, err := contextDigest(context)
 	if err != nil {

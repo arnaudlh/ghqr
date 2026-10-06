@@ -21,7 +21,7 @@ import (
 // `ghqr assess run --live` run.json, a synthetic fixture, or other
 // already-collected evidence in the same JSON shape) and explicit assessor
 // confirmation input.
-func addAssessmentEvaluateCommands(command *cobra.Command, profilePath, configPath *string) {
+func addAssessmentEvaluateCommands(command *cobra.Command, profilePath, configPath, checksPath, answersPath *string) {
 	var runPath, outputDirectory, evidenceDirectory string
 	var allowUnverified, overwrite bool
 	evaluate := &cobra.Command{
@@ -73,6 +73,14 @@ func addAssessmentEvaluateCommands(command *cobra.Command, profilePath, configPa
 				return err
 			}
 			config, err := assessment.LoadConfig(*configPath)
+			if err != nil {
+				return err
+			}
+			config.CheckDefinitions, err = assessment.LoadSimpleChecks(profile, *checksPath)
+			if err != nil {
+				return err
+			}
+			config.InterviewAnswers, err = assessment.ReadInterviewAnswers(*answersPath)
 			if err != nil {
 				return err
 			}

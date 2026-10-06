@@ -796,3 +796,125 @@ profile's 150 Full-automation controls, and `results.csv` always containing
 
 A production performance benchmark requires an explicitly supplied safe target.
 Fixture timing cannot establish production acceptance.
+
+## Bounded declarative checks and configuration extraction
+
+`--checks <file.json>` selects a strict, versioned JSON policy. The bundled
+[`simple-checks.v1.json`](../internal/assessment/profile/simple-checks.v1.json)
+contains two classification mappings, for **existing ARC-005 and GOV-001 only**,
+and one configuration extraction from the **existing `repo.details` collector**.
+It does not add endpoints, framework IDs or coverage of the 244 unsupported rules.
+
+The distinction matters:
+
+* A check's `metric_key` and `field_path` select an already calculated metric.
+  Only declared control metrics and `/overall/number`, `/overall/boolean` or
+  `/overall/text` are supported. For example, a numeric `gte` predicate with
+  `expected_values: [90]` proposes IMPLEMENTED at 90 or above; the separate
+  partial predicate defaults to 60. The default behavior is unchanged.
+* An extraction's `field_path` selects a field **inside the safely collected
+  repository configuration JSON**, not inside a precomputed metric. The default
+  is `/security_and_analysis/dependabot_security_updates/status`, type `string`,
+  known values `["enabled", "disabled"]`, enabled predicate `eq ["enabled"]`.
+  Changing this path changes the configuration fact read by `assess run --checks`.
+  It is explicit customer assessment policy, not a new GitHub requirement.
+* JSON paths support named object fields only, at most eight levels. Scalar
+  types are `number`, `boolean` and `string`; check operators are
+  `eq`, `in`, `gte`, `gt`, `lte`, `lt`. Configuration extraction permits
+  `eq`/`in` over an explicit typed known-value enumeration. No expressions,
+  scripts, URLs, endpoint selection, array traversal or arbitrary control IDs
+  are executable.
+
+For a synthetic example with two present settings, changing the extraction path
+to `/security_and_analysis/secret_scanning/status` reads that different setting
+and changes the measured fact. Such a change intentionally changes the policy's
+meaning: it must not be represented as the original Dependabot requirement.
+Missing, null, wrong-type or unrecognized values remain **unknown**, never
+known-disabled. Eligibility, populations, effective rules, cryptographic
+verification and compound-rule reasoning remain in Go.
+
+Every loaded policy retains its exact source bytes and SHA-256. Constructed
+unbound policies or subsequent mutation of their values, bytes or digest are
+rejected. Check results carry the definition digest; selected-metric evidence
+comes from the selected metric, not an old metric. The existing YAML threshold
+override remains explicit and takes precedence for numeric `gte` implemented
+floors. Profile questions and mandatory confirmation cannot be removed by JSON.
+
+New collection contexts bind the exact extraction definitions. Verified
+analysis replays the captured extraction, not the latest local mapping.
+Changing extraction requires a new collection; an analysis override may change
+classification policy but cannot silently reinterpret the original captured
+configuration facts. Legacy contexts retain the original extractor behavior.
+
+```bash
+ghqr assess run --live --config customer.yaml --checks checks.json > run.json
+ghqr assess evaluate --config customer.yaml --run run.json \
+  --evidence-dir ./evidence --checks checks.json --out ./analysis
+```
+
+## One portable file and separate discussion answers
+
+Export saved data without making an API request or rerunning analysis:
+
+```bash
+ghqr assess export --config customer.yaml --run run.json \
+  --evidence-dir ./evidence --out assessment-data.zip
+```
+
+The private ZIP preserves exact run/profile/context and **this run's cited**
+immutable raw/meta evidence/reference bytes, not other historical runs or
+unrelated scopes sharing the same evidence directory. It includes
+the selected check definitions, engine/rule IDs, host-qualified scope and a
+relative file-size/SHA-256 manifest. Its copied configuration uses
+`evidence_dir: ./evidence`; credential fields are environment-variable
+**references**, not values. No token is resolved, keyring is read, or source
+directory rewritten. Export does not claim analysis succeeded and never
+overwrites an existing portable file. Only regular sanitized JSON evidence is
+packaged; links and unredacted sensitive fields are rejected.
+
+Transfer that one file to another directory or machine with a compatible `ghqr`
+binary. No original directory, profile file, GitHub credential or network is
+needed:
+
+```bash
+ghqr assess analyse --bundle assessment-data.zip \
+  --accept-bundle-scope --out ./analysis --answers discussion-answers.json
+```
+
+`analyze` is an alias. Scope consent is mandatory: either explicitly accept only
+the file's recorded scope with `--accept-bundle-scope`, or supply a local
+`--config` authorizing it. The bundled profile cannot be replaced with
+`--profile`. An existing analysis output requires explicit `--overwrite`.
+`--checks` can override classification only if its extraction contract matches
+the capture. The original ZIP is never modified.
+
+Analysis rejects traversal, duplicate/case-colliding names, symlinks, unsupported
+versions, missing/changed/unlisted files and digest or scope mismatches. Limits
+are 20,000 members, 32 MiB per expanded member and 512 MiB total expanded data.
+These checks establish transfer **integrity, not independently trusted
+provenance**. Existing immutable context, original-outcome, exact-reference and
+full offline-replay guards must also pass before the nine contractual outputs
+receive verified status. Re-signing a manifest does not make invented metrics
+genuine.
+
+Discussion answers are a separate JSON array, for example:
+
+```json
+[
+  {
+    "control_id": "GOV-001",
+    "answer": "The team reviews rules and assigns an owner for each change.",
+    "respondent": "reviewer",
+    "answered_at": "2026-10-01T12:00:00Z",
+    "evidence_refs": ["interview:rules-review-1"]
+  }
+]
+```
+
+The interview guide shows **GitHub facts** separately from the **discussion
+answer, respondent, date and supporting evidence**. Unanswered questions stay
+pending. An answer never changes a measured proposal, supplies missing GitHub
+facts or creates an assessor confirmation. Explicit human decisions remain the
+separate `assess confirm --decisions` workflow. Invalid or duplicate answers
+fail before canonical output is written. The same separate `--answers` input
+is available on `assess evaluate`.

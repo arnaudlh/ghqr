@@ -143,6 +143,8 @@ type CustomerConfig struct {
 	ProductionEnvRegex string               `yaml:"production_env_regex" json:"production_env_regex"`
 	Thresholds         map[string]float64   `yaml:"thresholds" json:"thresholds"`
 	EvidenceDir        string               `yaml:"evidence_dir" json:"evidence_dir"`
+	CheckDefinitions   *SimpleChecks        `yaml:"-" json:"-"`
+	InterviewAnswers   []InterviewAnswer    `yaml:"-" json:"-"`
 	// SCIMMode is the single-host form's equivalent of Target.SCIMMode.
 	SCIMMode string `yaml:"scim_mode" json:"scim_mode,omitempty"`
 }

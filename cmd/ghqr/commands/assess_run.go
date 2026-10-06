@@ -15,7 +15,7 @@ import (
 // requires explicit --live consent, mirroring preflight's contract: this run
 // contacts the configured, read-only GitHub REST endpoints and never starts new
 // network access by default.
-func addAssessmentRunCommand(command *cobra.Command, profilePath, configPath *string) {
+func addAssessmentRunCommand(command *cobra.Command, profilePath, configPath, checksPath *string) {
 	var live bool
 	run := &cobra.Command{
 		Use: "run", Short: "Collect org inventory/settings, effective default-branch rules and workflow pin metrics; requires --live",
@@ -33,6 +33,10 @@ func addAssessmentRunCommand(command *cobra.Command, profilePath, configPath *st
 				return err
 			}
 			config, err := assessment.LoadConfig(*configPath)
+			if err != nil {
+				return err
+			}
+			config.CheckDefinitions, err = assessment.LoadSimpleChecks(profile, *checksPath)
 			if err != nil {
 				return err
 			}

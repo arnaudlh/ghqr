@@ -16,17 +16,19 @@ func init() {
 }
 
 func newAssessCommand() *cobra.Command {
-	var profilePath, configPath string
+	var profilePath, configPath, checksPath, answersPath string
 	command := &cobra.Command{
 		Use: "assess", Short: "Inspect the evidence-backed Well-Architected assessment foundation",
 		Long: "A separate assessment workflow with a bundled version-2 profile and explicit customer configuration.\n" +
 			"Profile and plan operations are offline. Preflight and run require explicit --live consent before contacting " +
-			"GitHub; import and replay operate on explicit offline evidence. Full control scoring and interview evaluators " +
-			"are not implemented yet.",
+			"GitHub; import, replay, evaluate, portable export and analysis are offline. Only registered controls are " +
+			"scored; unsupported checks remain unassessed, and discussion answers never create confirmations.",
 		Args: cobra.NoArgs,
 	}
 	command.PersistentFlags().StringVar(&profilePath, "profile", "", "Override the bundled version-2 profile with an explicit automation-spec.json")
 	command.PersistentFlags().StringVar(&configPath, "config", "", "Path to explicit customer scope YAML")
+	command.PersistentFlags().StringVar(&checksPath, "checks", "", "Versioned JSON policy for existing simple checks and one repo.details configuration-field extraction")
+	command.PersistentFlags().StringVar(&answersPath, "answers", "", "Separate discussion-answer JSON; answers never automatically confirm controls")
 	command.AddCommand(&cobra.Command{
 		Use: "profile", Short: "Validate profile identities, origins and collector references (offline)",
 		Args: cobra.NoArgs,
@@ -64,7 +66,8 @@ func newAssessCommand() *cobra.Command {
 		},
 	})
 	addAssessmentCollectionCommands(command, &profilePath, &configPath)
-	addAssessmentRunCommand(command, &profilePath, &configPath)
-	addAssessmentEvaluateCommands(command, &profilePath, &configPath)
+	addAssessmentRunCommand(command, &profilePath, &configPath, &checksPath)
+	addAssessmentEvaluateCommands(command, &profilePath, &configPath, &checksPath, &answersPath)
+	addAssessmentPortableCommands(command, &profilePath, &configPath, &checksPath, &answersPath)
 	return command
 }

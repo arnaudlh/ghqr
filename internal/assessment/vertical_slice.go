@@ -203,6 +203,11 @@ func RunVerticalSlice(ctx context.Context, profile *Profile, config *CustomerCon
 
 func runVerticalSliceWithStore(ctx context.Context, profile *Profile, config *CustomerConfig, targets []Target,
 	store *EvidenceStore, clock Clock, newClient func(Target, EvidenceSource) (*CollectionClient, error)) (*VerticalSliceReport, error) {
+	if config.CheckDefinitions != nil {
+		if err := config.CheckDefinitions.Validate(profile); err != nil {
+			return nil, fmt.Errorf("validate configuration extraction policy: %w", err)
+		}
+	}
 	// clock.Now() is read exactly ONCE here and reused for every single
 	// "now"-derived fact this run computes (report.CollectedAt, the
 	// lookback/alert window starts, and every per-organization population
@@ -377,7 +382,7 @@ func runVerticalSliceWithStore(ctx context.Context, profile *Profile, config *Cu
 				owner, name := splitOwnerRepo(fullName)
 				repoScope := Scope{Host: target.Host, Kind: RepositoryScope, Name: fullName}
 				repoResult := analyzeOneRepository(ctx, client, graphQLClient, store, orgScope, repoScope, organization, owner, name, repo,
-					lookbackStart, now, criticalKnown, criticalFullNames[fullName], trustedMaterial, report, accumulator)
+					lookbackStart, now, criticalKnown, criticalFullNames[fullName], trustedMaterial, report, accumulator, config.CheckDefinitions)
 				orgResult.Repositories = append(orgResult.Repositories, repoResult)
 			}
 			orgResult.Operational = analyzeOrganizationOperational(ctx, client, graphQLClient, store, orgScope, organization,
@@ -557,7 +562,7 @@ func analyzeOrganizationOperational(ctx context.Context, client, graphQLClient *
 func analyzeOneRepository(ctx context.Context, client, graphQLClient *CollectionClient, store *EvidenceStore, orgScope, repoScope Scope,
 	organization, owner, name string, repo *github.Repository, lookbackStart, now time.Time,
 	criticalPopulationKnown, isCriticalRepository bool, attestationTrustedMaterial root.TrustedMaterial,
-	report *VerticalSliceReport, accumulator *metricAccumulator) RepositoryRunResult {
+	report *VerticalSliceReport, accumulator *metricAccumulator, checks *SimpleChecks) RepositoryRunResult {
 	details, detailsOutcome, detailsErr := FetchRepositoryDetails(ctx, client, store, repoScope, owner, name)
 	report.Outcomes = append(report.Outcomes, detailsOutcome)
 	defaultBranch := repo.GetDefaultBranch()
@@ -685,7 +690,20 @@ func analyzeOneRepository(ctx context.Context, client, graphQLClient *Collection
 	// GetStatus() returning "" for an omitted field must never coerce into
 	// a confident known-disabled zero.
 	if result.Feature.DependencyEligible && detailsErr == nil && details != nil {
-		if analysis := details.GetSecurityAndAnalysis(); analysis != nil {
+		if checks != nil {
+			raw, _, _, loadErr := store.LoadJSON(repoScope, "repo.details", pageFeatureName(detailsOutcome.Feature, 1))
+			if loadErr != nil {
+				report.Caveats = append(report.Caveats, fmt.Sprintf("%s: configuration extraction source unavailable: %s", repoScope.Key(), loadErr))
+			} else {
+				enabled, extractionErr := extractRepositoryConfiguration(raw, checks)
+				if extractionErr != nil {
+					report.Caveats = append(report.Caveats, fmt.Sprintf("%s: configuration extraction unknown: %s", repoScope.Key(), extractionErr))
+				} else {
+					result.Feature.DependencyOperationalKnown = true
+					result.Feature.DependencyOperational = *enabled
+				}
+			}
+		} else if analysis := details.GetSecurityAndAnalysis(); analysis != nil {
 			if updates := analysis.GetDependabotSecurityUpdates(); updates != nil {
 				switch updates.GetStatus() {
 				case "enabled":
