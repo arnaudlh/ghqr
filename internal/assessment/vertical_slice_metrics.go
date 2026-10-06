@@ -247,6 +247,23 @@ func (a *metricAccumulator) addFeatureSignal(organizationKey string, signal Repo
 	a.featureSignals.add(organizationKey, []RepositoryFeatureSignal{signal}, true)
 }
 
+// featureSignalsByFullName indexes this organization's already-collected
+// RepositoryFeatureSignal values (one per repository analyzeOneRepository
+// actually ran for this organization, added via addFeatureSignal before
+// analyzeOrganizationOperational runs) by repository full name. Collectors
+// that need one specific repository's own CodeQL/dependency eligibility --
+// rather than the pooled cohort view AggregateFeatureCoverage already
+// computes -- use this instead of a second, divergent eligibility
+// determination.
+func (a *metricAccumulator) featureSignalsByFullName(organizationKey string) map[string]RepositoryFeatureSignal {
+	signals := a.featureSignals.byOrganization[organizationKey]
+	indexed := make(map[string]RepositoryFeatureSignal, len(signals))
+	for _, signal := range signals {
+		indexed[signal.FullName] = signal
+	}
+	return indexed
+}
+
 // addAttestationSignal folds one repository's critical_repos_with_attestations_pct
 // pooling signal into both the run-wide pooled bucket and its own
 // organization's bucket, mirroring addFeatureSignal's identical
@@ -727,30 +744,54 @@ func (a *metricAccumulator) populateMembershipMetrics(metrics map[string]Metric)
 }
 
 // populateSecurityConfigCoverage pools every organization's already-computed
-// code security configuration coverage MetricValue into one overall figure
-// via a simple numerator/denominator sum (not a re-run of the underlying,
-// organization-scoped configuration-matching logic).
+// code security configuration coverage MetricValue into one overall figure.
+// An organization whose own coverage result is confidently MetricKnown
+// contributes its Numerator/Denominator to the pooled sum; one that is
+// confidently MetricInapplicable (a confirmed, zero-eligible-repository
+// population for that organization) contributes nothing to the sum but does
+// NOT itself make the overall figure unknown. Any other status -- the
+// organization's own configuration/attachment inventory could not be
+// determined at all -- is a genuinely unresolved peer: an unresolved
+// organization could itself turn out to contain additional eligible,
+// non-compliant repositories, which would change the true pooled result, so
+// the overall Status/Number must explicitly become MetricUnavailable rather
+// than silently reporting the known subset's sum as if every organization
+// had resolved. The confidently-known subset's Numerator/Denominator are
+// still retained on the unavailable metric (never erased to nil), matching
+// cohortCoverageMetric's identical contract for CodeQL/Dependency/attestation
+// coverage -- a caveat string alone does not satisfy this; Status and Number
+// must themselves reflect the uncertainty.
 func (a *metricAccumulator) populateSecurityConfigCoverage(metrics map[string]Metric) {
 	if len(a.securityConfigCoverageByOrg) == 0 {
 		return
 	}
 	numerator, denominator := 0.0, 0.0
-	allKnown := true
+	anyUnknown := false
 	for _, value := range a.securityConfigCoverageByOrg {
-		if value.Status != MetricKnown || value.Numerator == nil || value.Denominator == nil {
-			allKnown = false
-			continue
+		switch value.Status {
+		case MetricKnown:
+			if value.Numerator != nil && value.Denominator != nil {
+				numerator += *value.Numerator
+				denominator += *value.Denominator
+			}
+		case MetricInapplicable:
+			// A confirmed, zero-eligible-repository organization: a
+			// genuine 0/0 contribution, not an unresolved peer.
+		default:
+			anyUnknown = true
 		}
-		numerator += *value.Numerator
-		denominator += *value.Denominator
 	}
 	population := "organization-eligible repositories with an attached/enforced configuration enabling every required feature"
-	overall := MetricValue{Status: MetricUnavailable, Population: population, EvidenceRefs: []string{},
-		Reason: "one or more organizations' code security configuration coverage was unavailable or inapplicable"}
-	if allKnown {
-		if computed, err := Percentage(numerator, denominator, population); err == nil {
-			overall = computed
-		}
+	overall, err := securityCoverage(numerator, denominator, population)
+	if err != nil {
+		overall = MetricValue{Status: MetricUnavailable, Population: population, EvidenceRefs: []string{}}
+	}
+	if anyUnknown {
+		overall.Status = MetricUnavailable
+		overall.Number = nil
+		overall.Reason = "one or more organizations' code security configuration coverage could not be determined; " +
+			"an unresolved organization could change this feature's cohort or result, so the known subset's " +
+			"retained counts alone cannot be reported as a confident coverage percentage"
 	}
 	setMetric(metrics, codeSecurityConfigurationCoveragePopulationKey, overall)
 	for organizationKey, value := range a.securityConfigCoverageByOrg {

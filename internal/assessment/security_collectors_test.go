@@ -16,6 +16,25 @@ import (
 	"time"
 )
 
+// fullyEligibleFeatureSignals builds a featureSignals map (the shape
+// FetchOrgCodeSecurityConfigurations expects from accumulator.
+// featureSignalsByFullName) where every named repository is CONFIRMED
+// eligible for both CodeQL and dependency features -- the uniform
+// "requires all four features" policy these fixtures were originally
+// written against, before per-repository feature-specific eligibility was
+// introduced. Tests that specifically exercise the narrower,
+// eligibility-derived policy build their own signals map instead.
+func fullyEligibleFeatureSignals(fullNames ...string) map[string]RepositoryFeatureSignal {
+	signals := make(map[string]RepositoryFeatureSignal, len(fullNames))
+	for _, fullName := range fullNames {
+		signals[fullName] = RepositoryFeatureSignal{
+			FullName: fullName, CodeQLEligibleKnown: true, CodeQLEligible: true,
+			DependencyEligibleKnown: true, DependencyEligible: true,
+		}
+	}
+	return signals
+}
+
 // TestFetchOrgDependabotAlertsOpenAndClosedLifecycles exercises the open and
 // closed (fixed/dismissed/auto_dismissed) state fetches, confirms both are
 // folded into one observation set and confirms a dismissed alert is
@@ -393,7 +412,8 @@ func TestFetchOrgCodeSecurityConfigurationsHostQualifiedIDsAndUnknownAttachment(
 	scope := Scope{client.base.Hostname(), OrganizationScope, "fixture-org"}
 
 	metric, _, err := FetchOrgCodeSecurityConfigurations(context.Background(), client, store, scope, "fixture-org",
-		[]string{"fixture-org/repo-001", "fixture-org/repo-002"})
+		[]string{"fixture-org/repo-001", "fixture-org/repo-002"},
+		fullyEligibleFeatureSignals("fixture-org/repo-001", "fixture-org/repo-002"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -430,12 +450,168 @@ func TestFetchOrgCodeSecurityConfigurationsFullFeatureOnly(t *testing.T) {
 	store := evidenceFixtureStore(t, t.TempDir(), nil)
 	scope := Scope{client.base.Hostname(), OrganizationScope, "fixture-org"}
 
-	metric, _, err := FetchOrgCodeSecurityConfigurations(context.Background(), client, store, scope, "fixture-org", []string{"fixture-org/repo-001"})
+	metric, _, err := FetchOrgCodeSecurityConfigurations(context.Background(), client, store, scope, "fixture-org",
+		[]string{"fixture-org/repo-001"}, fullyEligibleFeatureSignals("fixture-org/repo-001"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if metric.Status != MetricKnown || metric.Number == nil || *metric.Number != 0 {
 		t.Fatalf("partial feature enablement (push protection disabled) must not count toward full coverage: %+v", metric)
+	}
+}
+
+// TestFetchOrgCodeSecurityConfigurationsNarrowsRequiredFeaturesPerRepositoryEligibility
+// proves the collector-level wiring (not merely the lower-level
+// SecurityConfigurationCoverage helper in isolation) actually threads each
+// repository's own CodeQL/dependency eligibility signal into its
+// required-feature policy: a repository CONFIRMED non-eligible for CodeQL
+// (so code_scanning_default_setup is not demanded of it) still counts as
+// fully covered despite that one feature being disabled on its attached
+// configuration, while a repository this run never analyzed at all (absent
+// from featureSignals) leaves the WHOLE metric unavailable rather than
+// silently defaulting to "fully eligible, fully required".
+func TestFetchOrgCodeSecurityConfigurationsNarrowsRequiredFeaturesPerRepositoryEligibility(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/orgs/fixture-org/code-security/configurations":
+			writeJSON(t, writer, []map[string]any{
+				{"id": 1, "target_type": "organization", "enforcement": "enforced",
+					"secret_scanning": "enabled", "secret_scanning_push_protection": "enabled",
+					"dependabot_alerts": "enabled", "code_scanning_default_setup": "disabled"},
+			})
+		case "/orgs/fixture-org/code-security/configurations/defaults":
+			writeJSON(t, writer, []map[string]any{})
+		case "/orgs/fixture-org/code-security/configurations/1/repositories":
+			writeJSON(t, writer, []map[string]any{
+				{"status": "attached", "repository": map[string]any{"full_name": "fixture-org/repo-codeql-ineligible"}},
+			})
+		default:
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	scope := Scope{client.base.Hostname(), OrganizationScope, "fixture-org"}
+
+	// (1) A repository CONFIRMED CodeQL-ineligible (no supported language)
+	// but dependency-eligible is judged only against the features it could
+	// plausibly carry; code_scanning_default_setup being disabled must not
+	// count against it.
+	signals := map[string]RepositoryFeatureSignal{
+		"fixture-org/repo-codeql-ineligible": {
+			FullName: "fixture-org/repo-codeql-ineligible", CodeQLEligibleKnown: true, CodeQLEligible: false,
+			DependencyEligibleKnown: true, DependencyEligible: true,
+		},
+	}
+	metric, _, err := FetchOrgCodeSecurityConfigurations(context.Background(), client, evidenceFixtureStore(t, t.TempDir(), nil),
+		scope, "fixture-org", []string{"fixture-org/repo-codeql-ineligible"}, signals)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metric.Status != MetricKnown || metric.Number == nil || *metric.Number != 100 {
+		t.Fatalf("a CodeQL-ineligible repository must not need code_scanning_default_setup to count as fully covered: %+v", metric)
+	}
+
+	// (2) A repository this run never analyzed (absent from featureSignals
+	// entirely) must leave the whole metric unavailable, never silently
+	// treated as fully eligible/fully required.
+	metric, _, err = FetchOrgCodeSecurityConfigurations(context.Background(), client, evidenceFixtureStore(t, t.TempDir(), nil),
+		scope, "fixture-org", []string{"fixture-org/repo-codeql-ineligible", "fixture-org/repo-never-analyzed"}, signals)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metric.Status != MetricUnavailable {
+		t.Fatalf("a repository absent from featureSignals must not be treated as confidently eligible: %+v", metric)
+	}
+
+	// (3) A repository with an unresolved (not known either way) CodeQL
+	// eligibility signal also leaves the whole metric unavailable -- never
+	// silently narrowed to "feature not required" just because this run
+	// could not confirm eligibility.
+	signals["fixture-org/repo-unresolved"] = RepositoryFeatureSignal{
+		FullName: "fixture-org/repo-unresolved", CodeQLEligibleKnown: false,
+		DependencyEligibleKnown: true, DependencyEligible: true,
+	}
+	metric, _, err = FetchOrgCodeSecurityConfigurations(context.Background(), client, evidenceFixtureStore(t, t.TempDir(), nil),
+		scope, "fixture-org", []string{"fixture-org/repo-codeql-ineligible", "fixture-org/repo-unresolved"}, signals)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metric.Status != MetricUnavailable {
+		t.Fatalf("a repository with unresolved CodeQL eligibility must not be treated as confidently eligible: %+v", metric)
+	}
+}
+
+// TestFetchOrgCodeSecurityConfigurationsMissingFieldsCannotBecomeKnownZero
+// confirms three distinct malformed-response shapes are never silently
+// excluded as if they simply did not exist: a configuration entry missing
+// its own ID, a configuration entry missing (or carrying an unrecognized)
+// enforcement value, and an attachment entry missing its own repository
+// identity. Each must mark the whole result unavailable (never a
+// known-clean 0%/100%), while a genuinely complete, fully-populated
+// positive case still reports a confident 100%.
+func TestFetchOrgCodeSecurityConfigurationsMissingFieldsCannotBecomeKnownZero(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		config      map[string]any
+		attachments []map[string]any
+		wantKnown   bool
+	}{
+		{
+			name: "complete positive", wantKnown: true,
+			config: map[string]any{"id": 1, "enforcement": "enforced", "secret_scanning": "enabled",
+				"secret_scanning_push_protection": "enabled", "dependabot_alerts": "enabled", "code_scanning_default_setup": "enabled"},
+			attachments: []map[string]any{{"repository": map[string]any{"full_name": "fixture-org/repo"}, "status": "attached"}},
+		},
+		{
+			name: "missing enforcement",
+			config: map[string]any{"id": 1, "secret_scanning": "enabled", "secret_scanning_push_protection": "enabled",
+				"dependabot_alerts": "enabled", "code_scanning_default_setup": "enabled"},
+			attachments: []map[string]any{{"repository": map[string]any{"full_name": "fixture-org/repo"}, "status": "attached"}},
+		},
+		{
+			name: "missing configuration identity", config: map[string]any{"name": "unknown-id"},
+			attachments: []map[string]any{},
+		},
+		{
+			name: "missing attachment repository",
+			config: map[string]any{"id": 1, "enforcement": "enforced", "secret_scanning": "enabled",
+				"secret_scanning_push_protection": "enabled", "dependabot_alerts": "enabled", "code_scanning_default_setup": "enabled"},
+			attachments: []map[string]any{{"repository": nil, "status": "attached"}},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				switch request.URL.Path {
+				case "/orgs/fixture-org/code-security/configurations":
+					writeJSON(t, writer, []map[string]any{test.config})
+				case "/orgs/fixture-org/code-security/configurations/defaults":
+					writeJSON(t, writer, []map[string]any{})
+				case "/orgs/fixture-org/code-security/configurations/1/repositories":
+					writeJSON(t, writer, test.attachments)
+				default:
+					writer.WriteHeader(http.StatusNotFound)
+					writeJSON(t, writer, map[string]string{"message": "not found"})
+				}
+			}))
+			t.Cleanup(server.Close)
+			client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+			scope := Scope{Host: client.base.Hostname(), Kind: OrganizationScope, Name: "fixture-org"}
+			metric, _, err := FetchOrgCodeSecurityConfigurations(context.Background(), client, evidenceFixtureStore(t, t.TempDir(), nil),
+				scope, "fixture-org", []string{"fixture-org/repo"}, fullyEligibleFeatureSignals("fixture-org/repo"))
+			if test.wantKnown {
+				if err != nil || metric.Status != MetricKnown || metric.Number == nil || *metric.Number != 100 {
+					t.Fatalf("genuine attached/enforced full configuration did not report 100%%: %+v err=%v", metric, err)
+				}
+				if len(metric.EvidenceRefs) == 0 {
+					t.Fatalf("a genuine known result must retain its observed evidence refs, not report them empty: %+v", metric)
+				}
+				return
+			}
+			if err == nil && metric.Status == MetricKnown {
+				t.Fatalf("missing required configuration/attachment facts became a known clean-looking zero: %+v", metric)
+			}
+		})
 	}
 }
 

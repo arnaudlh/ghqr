@@ -65,5 +65,6 @@ func newAssessCommand() *cobra.Command {
 	})
 	addAssessmentCollectionCommands(command, &profilePath, &configPath)
 	addAssessmentRunCommand(command, &profilePath, &configPath)
+	addAssessmentEvaluateCommands(command, &profilePath, &configPath)
 	return command
 }

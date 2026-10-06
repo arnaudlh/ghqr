@@ -127,6 +127,20 @@ type VerticalSliceReport struct {
 	Metrics               map[string]Metric         `json:"metrics"`
 	Outcomes              []CollectorOutcome        `json:"collector_outcomes"`
 	Caveats               []string                  `json:"caveats"`
+	// ContextRef is the content-addressed digest (see
+	// WriteRunCollectionContext/LoadRunCollectionContextByRef in
+	// run_collection_context.go) of the exact, immutable, non-secret
+	// collection-time configuration record this run was captured under.
+	// RunVerticalSlice populates this itself, as part of its own success
+	// contract, before returning the report to ANY caller (library or CLI):
+	// a report is never published with a successful run but no bound
+	// context ref. A later verification/replay binds to precisely this
+	// historical context (via LoadRunCollectionContextByRef), never
+	// whatever the evidence directory's "latest" context happens to be by
+	// the time someone gets around to verifying -- the same evidence
+	// directory can accumulate many runs' worth of history, each with its
+	// own report citing its own context.
+	ContextRef string `json:"context_ref,omitempty"`
 }
 
 // RunVerticalSlice performs explicitly live-consented collection across every
@@ -159,6 +173,24 @@ func RunVerticalSlice(ctx context.Context, profile *Profile, config *CustomerCon
 		func(target Target, source EvidenceSource) (*CollectionClient, error) {
 			return NewCollectionClient(target, source, profile, budget, clock)
 		})
+	if runErr == nil {
+		// Captured here, inside RunVerticalSlice's own success contract --
+		// not left to an individual caller (CLI or library) to remember to
+		// do afterward -- so a successful run is never published without a
+		// bound, non-secret collection-time context ref. This uses the
+		// exact profile/config/targets this same call was itself validated
+		// and authorized against, the report's own CollectedAt, never an
+		// independently re-read wall-clock value, and the report's own
+		// just-finished, complete Outcomes list -- the one and only point
+		// a zero-page transport failure's true Reason text can ever be
+		// bound as genuine (see RunCollectionContext.OriginalOutcomes).
+		ref, contextErr := WriteRunCollectionContextWithOutcomes(store, profile, config, targets, report.CollectedAt, report.Outcomes)
+		if contextErr != nil {
+			runErr = fmt.Errorf("persist run collection context: %w", contextErr)
+		} else {
+			report.ContextRef = ref
+		}
+	}
 	closeErr := store.Close()
 	if runErr != nil {
 		return nil, runErr
@@ -171,14 +203,25 @@ func RunVerticalSlice(ctx context.Context, profile *Profile, config *CustomerCon
 
 func runVerticalSliceWithStore(ctx context.Context, profile *Profile, config *CustomerConfig, targets []Target,
 	store *EvidenceStore, clock Clock, newClient func(Target, EvidenceSource) (*CollectionClient, error)) (*VerticalSliceReport, error) {
+	// clock.Now() is read exactly ONCE here and reused for every single
+	// "now"-derived fact this run computes (report.CollectedAt, the
+	// lookback/alert window starts, and every per-organization population
+	// "active repository" cutoff below) -- never a second, independent
+	// clock.Now() call anywhere else in this function. A real SystemClock
+	// read fresh each time would make even two calls microseconds apart
+	// within the SAME run genuinely drift, which a later exact replay
+	// (itself seeded from this SAME frozen report.CollectedAt, never its
+	// own fresh clock read) could never bit-for-bit reproduce otherwise --
+	// defeating genuine field-by-field verification of every "now"-derived
+	// claim (for example an audit log's own requested lookback window).
+	now := clock.Now()
 	report := &VerticalSliceReport{
-		Profile: profile.Summary(), CollectedAt: clock.Now(),
+		Profile: profile.Summary(), CollectedAt: now,
 		ImplementedCollectors: RunImplementedCollectorIDs(), ImplementedEvaluators: []string{},
 		Organizations: []OrganizationRunResult{}, Targets: []TargetOperationalResult{},
 		Metrics: map[string]Metric{}, Outcomes: []CollectorOutcome{}, Caveats: []string{},
 	}
 	accumulator := newMetricAccumulator()
-	now := clock.Now()
 	lookbackStart := now.AddDate(0, 0, -config.LookbackDays)
 	alertWindowStart := now.AddDate(0, 0, -alertLifecycleWindowDays)
 	// Computed once per run (a pure function parsing an embedded resource,
@@ -303,7 +346,7 @@ func runVerticalSliceWithStore(ctx context.Context, profile *Profile, config *Cu
 				accumulator.addDefaultRepositoryPermission(orgScope.Key(), settings.GetDefaultRepoPermission())
 			}
 
-			population, eligible, populationOutcomes, err := BuildOrganizationPopulation(ctx, client, store, orgScope, organization, config, clock.Now())
+			population, eligible, populationOutcomes, err := BuildOrganizationPopulation(ctx, client, store, orgScope, organization, config, now)
 			report.Outcomes = append(report.Outcomes, populationOutcomes...)
 			if err != nil {
 				return nil, fmt.Errorf("build repository population for %s: %w", orgScope.Key(), err)
@@ -406,7 +449,8 @@ func analyzeOrganizationOperational(ctx context.Context, client, graphQLClient *
 	result.SecretScanningAlerts = &secretScanning
 	accumulator.addSecretScanningAlerts(organizationKey, secretScanning)
 
-	configCoverage, configOutcomes, configErr := FetchOrgCodeSecurityConfigurations(ctx, client, store, orgScope, organization, eligibleRepositoryFullNames)
+	configCoverage, configOutcomes, configErr := FetchOrgCodeSecurityConfigurations(ctx, client, store, orgScope, organization,
+		eligibleRepositoryFullNames, accumulator.featureSignalsByFullName(organizationKey))
 	report.Outcomes = append(report.Outcomes, configOutcomes...)
 	if configErr == nil {
 		result.CodeSecurityConfigCoverage = &configCoverage

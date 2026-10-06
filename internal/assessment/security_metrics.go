@@ -75,6 +75,16 @@ type SecurityRepositoryObservation struct {
 	Eligible       *bool
 	FeatureEnabled *bool
 	EvidenceRefs   []string
+	// RequiredFeatures overrides SecurityConfigurationCoverage's own
+	// function-wide requiredFeatures policy for this one repository --
+	// for example, a repository with CONFIRMED non-eligibility for a
+	// language-gated or manifest-gated feature should not need that
+	// feature's enablement to count as fully covered. Nil (the zero
+	// value) means the function-wide requiredFeatures argument applies
+	// unchanged, preserving every caller that does not set this field.
+	// SecurityFeatureCoverage ignores this field entirely (it already
+	// evaluates exactly one caller-chosen feature via FeatureEnabled).
+	RequiredFeatures []string
 }
 
 // SecurityFeatureCoverage computes coverage only over a known feature-specific denominator.
@@ -129,6 +139,12 @@ type SecurityAttachmentObservation struct {
 
 // SecurityConfigurationCoverage counts attached/enforced full-feature configurations.
 // Transitional/failed attachments are unavailable, not silently detached.
+// requiredFeatures is the default policy applied to every repository that
+// does not set its own SecurityRepositoryObservation.RequiredFeatures; a
+// repository whose own narrower policy (for example a repository with
+// confirmed non-eligibility for a language- or manifest-gated feature)
+// overrides it entirely for that one repository, so demanding a feature a
+// repository could never plausibly carry never masks as "not covered".
 func SecurityConfigurationCoverage(repositories []SecurityRepositoryObservation, configurations []SecurityConfigurationObservation,
 	attachments []SecurityAttachmentObservation, requiredFeatures []string, complete bool) (MetricValue, error) {
 	if err := validateSecurityRepositories(repositories); err != nil {
@@ -183,7 +199,14 @@ func SecurityConfigurationCoverage(repositories []SecurityRepositoryObservation,
 		if !exists {
 			return unavailableObservation("attached configuration settings are unavailable", "configuration-eligible repositories"), nil
 		}
-		enabled, known := configurationHasFeatures(configuration, requiredFeatures)
+		policy := requiredFeatures
+		if repository.RequiredFeatures != nil {
+			if err := validateRequiredFeaturePolicy(repository.RequiredFeatures); err != nil {
+				return MetricValue{}, err
+			}
+			policy = repository.RequiredFeatures
+		}
+		enabled, known := configurationHasFeatures(configuration, policy)
 		if !known {
 			return unavailableObservation("attached configuration feature settings are unknown", "configuration-eligible repositories"), nil
 		}
@@ -214,16 +237,28 @@ func validateSecurityRepositories(repositories []SecurityRepositoryObservation) 
 	return nil
 }
 
-func indexSecurityConfigurations(configurations []SecurityConfigurationObservation, features []string) (map[string]SecurityConfigurationObservation, error) {
+// validateRequiredFeaturePolicy rejects an empty or duplicated required-
+// feature list. It is applied both to SecurityConfigurationCoverage's
+// function-wide default policy and to any repository's own RequiredFeatures
+// override, so a per-repository policy narrowed by that repository's actual
+// eligibility is held to the identical structural standard as the default.
+func validateRequiredFeaturePolicy(features []string) error {
 	if len(features) == 0 {
-		return nil, fmt.Errorf("configuration coverage requires the feature policy")
+		return fmt.Errorf("configuration coverage requires the feature policy")
 	}
 	seenFeatures := map[string]bool{}
 	for _, feature := range features {
 		if feature == "" || seenFeatures[feature] {
-			return nil, fmt.Errorf("configuration policy features must be nonempty and unique")
+			return fmt.Errorf("configuration policy features must be nonempty and unique")
 		}
 		seenFeatures[feature] = true
+	}
+	return nil
+}
+
+func indexSecurityConfigurations(configurations []SecurityConfigurationObservation, features []string) (map[string]SecurityConfigurationObservation, error) {
+	if err := validateRequiredFeaturePolicy(features); err != nil {
+		return nil, err
 	}
 	index := make(map[string]SecurityConfigurationObservation, len(configurations))
 	for _, configuration := range configurations {

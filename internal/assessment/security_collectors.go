@@ -169,9 +169,51 @@ func secretScanningAlertObservation(alert *github.SecretScanningAlert) AlertObse
 // adapter requires for a repository's attached configuration to count as
 // "enabled": every one of these settings must be "enabled" (not merely
 // attached/enforced with some features off). This is an adapter choice, not a
-// profile-declared metric key.
+// profile-declared metric key. It is the fallback policy used only when a
+// repository's own feature-specific eligibility could not be determined at
+// all (requiredCodeSecurityFeaturesForRepository below returns known=false);
+// every repository this run actually analyzed receives its own narrower,
+// eligibility-derived policy instead.
 var requiredCodeSecurityConfigurationFeatures = []string{
 	"secret_scanning", "secret_scanning_push_protection", "dependabot_alerts", "code_scanning_default_setup",
+}
+
+// alwaysRequiredCodeSecurityConfigurationFeatures apply to every eligible
+// repository regardless of language or dependency-manifest eligibility:
+// secret scanning and its push-protection companion have no language- or
+// manifest-gated precondition of their own, unlike code_scanning_default_setup
+// (CodeQL-language eligibility) and dependabot_alerts (manifest/dependency
+// eligibility) below.
+var alwaysRequiredCodeSecurityConfigurationFeatures = []string{"secret_scanning", "secret_scanning_push_protection"}
+
+// requiredCodeSecurityFeaturesForRepository narrows the full four-feature
+// policy to the features this SPECIFIC repository could plausibly carry,
+// using the identical eligibility signals the published
+// CodeScanningEligibility/DependencyEligibility helpers and the per-repository
+// RepositoryFeatureSignal already compute elsewhere in this run -- never a
+// second, divergent eligibility determination. code_scanning_default_setup is
+// only demanded of a repository CONFIRMED CodeQL-eligible
+// (HasPositiveCodeQLSupportedLanguageBytes); dependabot_alerts only of one
+// CONFIRMED dependency-eligible (a supported manifest or an actual dependency
+// package observed). When this repository was never analyzed this run
+// (observed=false) or either eligibility signal is itself unresolved, this
+// repository's whole feature policy is unknown -- known returns false, which
+// the caller must treat as unresolved eligibility for the repository as a
+// whole (SecurityRepositoryObservation.Eligible=nil), never a confident
+// narrowing that happens to exclude a feature this run simply never
+// confirmed either way.
+func requiredCodeSecurityFeaturesForRepository(signal RepositoryFeatureSignal, observed bool) ([]string, bool) {
+	if !observed || !signal.CodeQLEligibleKnown || !signal.DependencyEligibleKnown {
+		return nil, false
+	}
+	features := append([]string{}, alwaysRequiredCodeSecurityConfigurationFeatures...)
+	if signal.CodeQLEligible {
+		features = append(features, "code_scanning_default_setup")
+	}
+	if signal.DependencyEligible {
+		features = append(features, "dependabot_alerts")
+	}
+	return features, true
 }
 
 // codeSecurityConfigurationCoveragePopulation documents this invented (not an
@@ -182,12 +224,28 @@ const codeSecurityConfigurationCoveragePopulationKey = "code_security_configurat
 // configuration catalogue, its default-for-new-repos assignments and, for
 // every configuration, its complete (paginated) repository attachment list,
 // then pools them with the already-known active/eligible repository
-// population into the published SecurityConfigurationCoverage helper. A
-// repository's configuration coverage is "enabled" only when every feature in
-// requiredCodeSecurityConfigurationFeatures reports "enabled" on its attached,
-// final-state (attached/enforced) configuration.
+// population into the published SecurityConfigurationCoverage helper. Each
+// repository's required-feature policy is its own
+// (requiredCodeSecurityFeaturesForRepository), derived from featureSignals --
+// the same per-repository CodeQL/dependency eligibility signal this run
+// already computed while analyzing that repository -- rather than demanding
+// every one of requiredCodeSecurityConfigurationFeatures uniformly from a
+// repository that could never plausibly carry a language- or manifest-gated
+// feature. A repository this run never analyzed, or whose own eligibility
+// signal is itself unresolved, is reported with Eligible=nil (unresolved),
+// which SecurityConfigurationCoverage already reports as an explicit
+// MetricUnavailable rather than a confident narrowing or exclusion.
+//
+// A configuration entry missing its own ID or a valid enforcement value, or
+// an attachment entry missing its own repository identity, is never
+// silently excluded as if it had never existed -- doing so would let a
+// response that is itself incomplete/malformed masquerade as "this
+// organization genuinely has none of this," a confident false. Each such
+// entry instead marks the whole result incomplete (complete=false), which
+// SecurityConfigurationCoverage reports as an explicit MetricUnavailable
+// with a semantic Reason, never a known clean zero.
 func FetchOrgCodeSecurityConfigurations(ctx context.Context, client *CollectionClient, store *EvidenceStore, orgScope Scope,
-	organization string, eligibleRepositoryFullNames []string) (MetricValue, []CollectorOutcome, error) {
+	organization string, eligibleRepositoryFullNames []string, featureSignals map[string]RepositoryFeatureSignal) (MetricValue, []CollectorOutcome, error) {
 	organizationPath := url.PathEscape(organization)
 	configs, listOutcome, listErr := collectJSONArray[*github.CodeSecurityConfiguration](ctx, client, store, orgScope,
 		"org.code_security_configs", "configurations", "orgs/"+organizationPath+"/code-security/configurations", "", true)
@@ -202,10 +260,24 @@ func FetchOrgCodeSecurityConfigurations(ctx context.Context, client *CollectionC
 	complete := listErr == nil && defaultsErr == nil
 	for _, config := range configs {
 		if config == nil || config.ID == nil {
+			// This configuration entry's own identity could not be
+			// confirmed at all: it cannot be indexed, matched to any
+			// attachment, or counted toward the catalogue -- excluding it
+			// silently would understate the true configuration count as if
+			// it simply did not exist.
+			complete = false
+			continue
+		}
+		if config.Enforcement == nil || (*config.Enforcement != "enforced" && *config.Enforcement != "unenforced") {
+			// An unobserved (or unrecognized) enforcement state is
+			// unknown, never coerced into a confident "unenforced" default
+			// -- that would let an unreported field masquerade as a
+			// genuine observation.
+			complete = false
 			continue
 		}
 		observations = append(observations, SecurityConfigurationObservation{
-			Host: orgScope.Host, ID: config.GetID(), Enforcement: codeSecurityEnforcementValue(config.Enforcement),
+			Host: orgScope.Host, ID: config.GetID(), Enforcement: *config.Enforcement,
 			Features: map[string]*bool{
 				"secret_scanning":                 codeSecurityFeatureState(config.SecretScanning),
 				"secret_scanning_push_protection": codeSecurityFeatureState(config.SecretScanningPushProtection),
@@ -223,21 +295,32 @@ func FetchOrgCodeSecurityConfigurations(ctx context.Context, client *CollectionC
 		}
 		for _, attachment := range repositories {
 			if attachment == nil || attachment.Repository == nil || attachment.Repository.GetFullName() == "" {
+				// A returned attachment entry whose own repository
+				// identity is missing is never silently excluded as if it
+				// never existed -- that would understate this
+				// configuration's true attached population.
+				complete = false
 				continue
 			}
 			attachments = append(attachments, SecurityAttachmentObservation{
 				Repository:      Scope{Host: orgScope.Host, Kind: RepositoryScope, Name: attachment.Repository.GetFullName()},
 				ConfigurationID: config.GetID(), Status: attachment.GetStatus(),
+				EvidenceRefs: append([]string{}, repositoriesOutcome.EvidenceRefs...),
 			})
 		}
 	}
 
 	repositories := make([]SecurityRepositoryObservation, 0, len(eligibleRepositoryFullNames))
-	eligible := true
 	for _, fullName := range eligibleRepositoryFullNames {
-		repositories = append(repositories, SecurityRepositoryObservation{
-			Scope: Scope{Host: orgScope.Host, Kind: RepositoryScope, Name: fullName}, Eligible: &eligible, EvidenceRefs: []string{},
-		})
+		signal, observed := featureSignals[fullName]
+		observation := SecurityRepositoryObservation{
+			Scope: Scope{Host: orgScope.Host, Kind: RepositoryScope, Name: fullName}, EvidenceRefs: append([]string{}, listOutcome.EvidenceRefs...),
+		}
+		if required, known := requiredCodeSecurityFeaturesForRepository(signal, observed); known {
+			eligible := true
+			observation.Eligible, observation.RequiredFeatures = &eligible, required
+		}
+		repositories = append(repositories, observation)
 	}
 
 	metric, err := SecurityConfigurationCoverage(repositories, observations, attachments, requiredCodeSecurityConfigurationFeatures, complete)
@@ -245,13 +328,6 @@ func FetchOrgCodeSecurityConfigurations(ctx context.Context, client *CollectionC
 		return MetricValue{}, outcomes, err
 	}
 	return metric, outcomes, nil
-}
-
-func codeSecurityEnforcementValue(enforcement *string) string {
-	if enforcement == nil || (*enforcement != "enforced" && *enforcement != "unenforced") {
-		return "unenforced"
-	}
-	return *enforcement
 }
 
 func codeSecurityFeatureState(value *string) *bool {

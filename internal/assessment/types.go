@@ -93,10 +93,20 @@ type CredentialKind string
 
 // Management Console credentials are distinct from GitHub API credentials.
 const (
-	NoCredential      CredentialKind = "none"
-	ClassicPAT        CredentialKind = "classic-pat"
-	FineGrainedPAT    CredentialKind = "fine-grained-pat"
-	AppInstallation   CredentialKind = "app-installation"
+	NoCredential    CredentialKind = "none"
+	ClassicPAT      CredentialKind = "classic-pat"
+	FineGrainedPAT  CredentialKind = "fine-grained-pat"
+	AppInstallation CredentialKind = "app-installation"
+	// OAuthUser is a GitHub OAuth App user-to-server token (the `gho_`
+	// prefix family): an ordinary Bearer-authenticated, read-only REST/
+	// GraphQL credential route, identical in transport terms to
+	// ClassicPAT/FineGrainedPAT -- it is its own distinct kind, never
+	// relabeled as ClassicPAT, because SCIM's own documented authentication
+	// contract is narrower than "any Bearer token" (see
+	// FetchEnterpriseSCIMUsers' own ClassicPAT-only gate) and a genuine
+	// credential-kind record must never claim a narrower route's
+	// authorization than what was actually used.
+	OAuthUser         CredentialKind = "oauth-user"
 	ManagementConsole CredentialKind = "management-console"
 )
 
@@ -121,6 +131,27 @@ type EvidenceMetadata struct {
 	Redactions     []string       `json:"redactions"`
 	WindowStart    *time.Time     `json:"window_start,omitempty"`
 	WindowEnd      *time.Time     `json:"window_end,omitempty"`
+	// PaginationContinues is a tri-state terminal-pagination proof,
+	// recorded once per page at collection time from that page's own Link
+	// header: true means a valid Link rel="next" was genuinely present,
+	// proving pagination was not yet done after this page (regardless of
+	// whether that next page was later fetched successfully -- a next page
+	// that then fails access/validation is exactly how a genuine
+	// partial-pagination outcome arises); false means this page's response
+	// was validly checked and genuinely carried no next link (or
+	// pagination was never requested for this call at all -- a
+	// non-paginated single fetch has no "further page" concept to begin
+	// with, by construction, not merely "none observed"); nil means
+	// genuinely unknown and must never be treated as equivalent to false:
+	// a page collected before this field existed (an older stored evidence
+	// bundle, which simply never recorded it, decoding to nil rather than
+	// a false the JSON schema never actually asserted) and a page whose
+	// Link header could not even be parsed (a malformed header still often
+	// indicates the server WAS trying to express a next link, so this is
+	// never proof pagination ended there either) both decode/compute to
+	// nil, not false -- only a genuinely checked, valid, empty Link header
+	// (or an explicitly non-paginated call) ever earns a confident false.
+	PaginationContinues *bool `json:"pagination_continues,omitempty"`
 }
 
 // CollectorOutcome is scoped to a host, collector and feature, not a whole token.

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -307,5 +308,488 @@ func TestImportJSONEnforcesImportContractBeforeWritingAnyEvidence(t *testing.T) 
 	ordinary := evidenceFixtureMetadata(t)
 	if _, err := ImportJSON(profile, config, []byte(`{"anything":true}`), ordinary); err != nil {
 		t.Fatalf("an ordinary scoped-API collector import must not be affected by the import-contract gate: %v", err)
+	}
+}
+
+// TestUICaptureAccessorsReportUnknownNeverCoerced confirms the shared
+// UISettingCapture.Fields typed accessors report an absent field, or a
+// field present with the wrong JSON type, as unknown (nil) -- never
+// silently coerced to false/""/0.
+func TestUICaptureAccessorsReportUnknownNeverCoerced(t *testing.T) {
+	fields := map[string]any{
+		"a_bool": true, "a_string": "value", "a_number": float64(42),
+		"bool_as_string": "true", "string_as_bool": false, "number_as_string": "42",
+	}
+	if value := uiCaptureBool(fields, "a_bool"); value == nil || *value != true {
+		t.Fatalf("expected the correctly-typed bool field read back: %v", value)
+	}
+	if value := uiCaptureBool(fields, "missing"); value != nil {
+		t.Fatalf("expected an absent field to report unknown, not false: %v", *value)
+	}
+	if value := uiCaptureBool(fields, "bool_as_string"); value != nil {
+		t.Fatalf("expected a wrong-typed field to report unknown, never coerced: %v", *value)
+	}
+	if value := uiCaptureString(fields, "a_string"); value == nil || *value != "value" {
+		t.Fatalf("expected the correctly-typed string field read back: %v", value)
+	}
+	if value := uiCaptureString(fields, "string_as_bool"); value != nil {
+		t.Fatalf("expected a wrong-typed field to report unknown, never coerced: %v", *value)
+	}
+	if value := uiCaptureFloat(fields, "a_number"); value == nil || *value != 42 {
+		t.Fatalf("expected the correctly-typed numeric field read back: %v", value)
+	}
+	if value := uiCaptureFloat(fields, "number_as_string"); value != nil {
+		t.Fatalf("expected a wrong-typed field to report unknown, never coerced: %v", *value)
+	}
+}
+
+// TestNormalizeGHESBackupImportComputesAgeRelativeToCapturedAtNotWallClock
+// confirms latest_snapshot_age_h is derived from the import's own
+// CapturedAt timestamp, not this process's live wall clock -- a report
+// generated days after collection must not silently inflate the apparent
+// snapshot age -- and that every other field this round normalizes
+// (backup_schedule, snapshots_retained, backup_encrypted) is a direct,
+// typed carry-over.
+func TestNormalizeGHESBackupImportComputesAgeRelativeToCapturedAtNotWallClock(t *testing.T) {
+	captured := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	snapshot := captured.Add(-6 * time.Hour)
+	retained, encrypted := 10, true
+	payload := GHESBackupImport{
+		CapturedAt: captured, ScheduleCronExpression: "0 2 * * *", RetainedSnapshots: &retained,
+		LatestSnapshotAt: &snapshot, LatestSnapshotStatus: "success", Encrypted: &encrypted,
+	}
+	observation := NormalizeGHESBackupImport(payload)
+	if observation.BackupSchedule == nil || *observation.BackupSchedule != "0 2 * * *" {
+		t.Fatalf("expected the cron expression carried over verbatim: %+v", observation)
+	}
+	if observation.LatestSnapshotAgeH == nil || *observation.LatestSnapshotAgeH != 6 {
+		t.Fatalf("expected a 6-hour age computed relative to captured_at, not live wall clock: %+v", observation)
+	}
+	if observation.SnapshotsRetained == nil || *observation.SnapshotsRetained != 10 {
+		t.Fatalf("expected the retained-snapshot count carried over: %+v", observation)
+	}
+	if observation.BackupEncrypted == nil || !*observation.BackupEncrypted {
+		t.Fatalf("expected the encrypted flag carried over: %+v", observation)
+	}
+}
+
+// TestNormalizeGHESBackupImportUnknownFieldsStayUnknown confirms an absent
+// schedule/snapshot timestamp/retained-count/encrypted flag, and a
+// logically impossible (future) latest-snapshot timestamp, all report
+// unknown -- never a fabricated zero/empty/false value.
+func TestNormalizeGHESBackupImportUnknownFieldsStayUnknown(t *testing.T) {
+	captured := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	observation := NormalizeGHESBackupImport(GHESBackupImport{CapturedAt: captured, LatestSnapshotStatus: "unknown"})
+	if observation.BackupSchedule != nil || observation.LatestSnapshotAgeH != nil ||
+		observation.SnapshotsRetained != nil || observation.BackupEncrypted != nil {
+		t.Fatalf("expected every unset field to stay unknown (nil), never a fabricated value: %+v", observation)
+	}
+
+	future := captured.Add(1 * time.Hour)
+	observation = NormalizeGHESBackupImport(GHESBackupImport{CapturedAt: captured, LatestSnapshotAt: &future, LatestSnapshotStatus: "success"})
+	if observation.LatestSnapshotAgeH != nil {
+		t.Fatalf("expected a logically impossible future snapshot timestamp to report unknown age, not a negative number: %+v", observation)
+	}
+}
+
+// TestNormalizeUIEntAuthCaptureRejectsMismatchedCollectorID confirms the
+// normalizer refuses to interpret a different collector's capture as
+// ui.ent_auth's own fields.
+func TestNormalizeUIEntAuthCaptureRejectsMismatchedCollectorID(t *testing.T) {
+	_, err := NormalizeUIEntAuthCapture(UISettingCapture{CollectorID: "ui.org_pat_policy", Fields: map[string]any{"sso_mode": "saml"}})
+	if err == nil {
+		t.Fatal("expected a mismatched collector_id to be rejected")
+	}
+}
+
+// TestNormalizeUIEntAuthCaptureKnownAndUnrecognizedModes confirms a
+// recognized sso_mode value normalizes (case/whitespace-insensitively), an
+// unrecognized value reports unknown rather than a fabricated new mode, and
+// sso_enforced/ip_allow_list_enabled normalize independently of sso_mode.
+func TestNormalizeUIEntAuthCaptureKnownAndUnrecognizedModes(t *testing.T) {
+	recognized, err := NormalizeUIEntAuthCapture(UISettingCapture{
+		CollectorID: "ui.ent_auth",
+		Fields:      map[string]any{"sso_mode": "  SAML ", "sso_enforced": true, "ip_allow_list_enabled": false},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recognized.SSOMode == nil || *recognized.SSOMode != "saml" {
+		t.Fatalf("expected a recognized sso_mode to normalize case/whitespace-insensitively: %+v", recognized)
+	}
+	if recognized.SSOEnforced == nil || !*recognized.SSOEnforced {
+		t.Fatalf("expected sso_enforced carried over: %+v", recognized)
+	}
+	if recognized.IPAllowListEnabled == nil || *recognized.IPAllowListEnabled {
+		t.Fatalf("expected ip_allow_list_enabled carried over as false (a known, confirmed negative): %+v", recognized)
+	}
+
+	unrecognized, err := NormalizeUIEntAuthCapture(UISettingCapture{
+		CollectorID: "ui.ent_auth", Fields: map[string]any{"sso_mode": "shibboleth"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unrecognized.SSOMode != nil {
+		t.Fatalf("expected an unrecognized sso_mode value to report unknown, never a fabricated new mode: %+v", unrecognized)
+	}
+}
+
+// TestNormalizeUIOrgPATPolicyCaptureKnownFields confirms the three
+// normalized fields carry over typed, and a mismatched collector_id is
+// rejected.
+func TestNormalizeUIOrgPATPolicyCaptureKnownFields(t *testing.T) {
+	if _, err := NormalizeUIOrgPATPolicyCapture(UISettingCapture{CollectorID: "ui.ent_auth"}); err == nil {
+		t.Fatal("expected a mismatched collector_id to be rejected")
+	}
+	observation, err := NormalizeUIOrgPATPolicyCapture(UISettingCapture{
+		CollectorID: "ui.org_pat_policy",
+		Fields: map[string]any{
+			"fine_grained_requires_approval": true, "classic_restricted": false, "max_lifetime_days": float64(366),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observation.FineGrainedRequiresApproval == nil || !*observation.FineGrainedRequiresApproval {
+		t.Fatalf("expected fine_grained_requires_approval carried over: %+v", observation)
+	}
+	if observation.ClassicRestricted == nil || *observation.ClassicRestricted {
+		t.Fatalf("expected classic_restricted carried over as a known false: %+v", observation)
+	}
+	if observation.MaxLifetimeDays == nil || *observation.MaxLifetimeDays != 366 {
+		t.Fatalf("expected max_lifetime_days carried over: %+v", observation)
+	}
+}
+
+// TestLoadNormalizedGHESBackupImportRoundTripsThroughTheEvidenceStore
+// proves the full read-back path: an evidence record saved exactly as
+// ImportJSON would persist it is read back out of the store and normalized
+// identically to calling NormalizeGHESBackupImport directly, and a missing
+// import at that scope/feature reports an explicit NotRun outcome, never a
+// confident empty result.
+func TestLoadNormalizedGHESBackupImportRoundTripsThroughTheEvidenceStore(t *testing.T) {
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	scope := Scope{Host: "github.example.com", Kind: EnterpriseScope, Name: "fixture-enterprise"}
+	metadata := evidenceFixtureMetadata(t)
+	metadata.CollectorID, metadata.Feature, metadata.Scope = "ghes.backup", "capture", scope
+	captured := metadata.CollectedAt
+	snapshot := captured.Add(-3 * time.Hour)
+	retained, encrypted := 14, true
+	raw, err := json.Marshal(GHESBackupImport{
+		CapturedAt: captured, ScheduleCronExpression: "0 3 * * *", RetainedSnapshots: &retained,
+		LatestSnapshotAt: &snapshot, LatestSnapshotStatus: "success", Encrypted: &encrypted,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SaveJSON(raw, metadata); err != nil {
+		t.Fatal(err)
+	}
+
+	observation, outcome, err := LoadNormalizedGHESBackupImport(store, fixtureProfileWithDefault(t), scope, "capture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.Status != CollectionOK || outcome.Readiness != ImportOnly {
+		t.Fatalf("expected a successful import-only outcome: %+v", outcome)
+	}
+	// Pages must be explicitly 1 whenever EvidenceRefs cites evidence (here,
+	// exactly 2 refs: data + metadata): replay verification elsewhere in
+	// this package cross-checks len(EvidenceRefs) == Pages*2 uniformly
+	// across every collector's outcomes, import-sourced or not.
+	if outcome.Pages != 1 || len(outcome.EvidenceRefs) != 2 {
+		t.Fatalf("expected Pages:1 matching the 2 cited evidence refs (data+metadata): %+v", outcome)
+	}
+	if observation.LatestSnapshotAgeH == nil || *observation.LatestSnapshotAgeH != 3 {
+		t.Fatalf("expected the round-tripped observation to normalize identically: %+v", observation)
+	}
+
+	_, missingOutcome, err := LoadNormalizedGHESBackupImport(store, fixtureProfileWithDefault(t), scope, "a-feature-never-imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missingOutcome.Status != NotRun {
+		t.Fatalf("expected a missing import at this scope/feature to report an explicit not-run outcome: %+v", missingOutcome)
+	}
+	if missingOutcome.Pages != 0 || len(missingOutcome.EvidenceRefs) != 0 {
+		t.Fatalf("expected Pages:0 matching zero cited evidence refs for a not-run outcome: %+v", missingOutcome)
+	}
+}
+
+// TestLoadNormalizedUIEntAuthCaptureRoundTripsThroughTheEvidenceStore
+// mirrors the ghes.backup round-trip test for the ui.ent_auth capture path.
+func TestLoadNormalizedUIEntAuthCaptureRoundTripsThroughTheEvidenceStore(t *testing.T) {
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	scope := Scope{Host: "github.com", Kind: EnterpriseScope, Name: "fixture-enterprise"}
+	metadata := evidenceFixtureMetadata(t)
+	metadata.CollectorID, metadata.Feature, metadata.Scope = "ui.ent_auth", "capture", scope
+	raw, err := json.Marshal(UISettingCapture{
+		CollectorID: "ui.ent_auth", CapturedBy: "assessor@example.com", CapturedAt: metadata.CollectedAt,
+		Fields: map[string]any{"sso_mode": "oidc", "sso_enforced": true, "ip_allow_list_enabled": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SaveJSON(raw, metadata); err != nil {
+		t.Fatal(err)
+	}
+
+	observation, outcome, err := LoadNormalizedUIEntAuthCapture(store, fixtureProfileWithDefault(t), scope, "capture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.Status != CollectionOK {
+		t.Fatalf("expected a successful import-only outcome: %+v", outcome)
+	}
+	if observation.SSOMode == nil || *observation.SSOMode != "oidc" {
+		t.Fatalf("expected the round-tripped sso_mode: %+v", observation)
+	}
+}
+
+// TestApplyNormalizedImportsFeedsExactProfileKeysIntoReportMetrics is the
+// production-wiring proof: ApplyNormalizedImports is not helper-only -- it
+// actually populates report.Metrics under the exact profile keys
+// NormalizedImportMetricKeys documents, with real, non-empty EvidenceRefs
+// pointing at the immutable stored evidence object pair, and a
+// CollectorOutcome recorded for every source (not just the successful
+// ones).
+func TestApplyNormalizedImportsFeedsExactProfileKeysIntoReportMetrics(t *testing.T) {
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	entScope := Scope{Host: "github.com", Kind: EnterpriseScope, Name: "fixture-enterprise"}
+	orgScope := Scope{Host: "github.com", Kind: OrganizationScope, Name: "fixture-org"}
+
+	entMetadata := evidenceFixtureMetadata(t)
+	entMetadata.CollectorID, entMetadata.Feature, entMetadata.Scope = "ui.ent_auth", "capture", entScope
+	entRaw, err := json.Marshal(UISettingCapture{
+		CollectorID: "ui.ent_auth", CapturedBy: "assessor@example.com", CapturedAt: entMetadata.CollectedAt,
+		Fields: map[string]any{"sso_mode": "saml", "sso_enforced": true, "ip_allow_list_enabled": false},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SaveJSON(entRaw, entMetadata); err != nil {
+		t.Fatal(err)
+	}
+
+	orgMetadata := evidenceFixtureMetadata(t)
+	orgMetadata.CollectorID, orgMetadata.Feature, orgMetadata.Scope = "ui.org_pat_policy", "capture", orgScope
+	orgRaw, err := json.Marshal(UISettingCapture{
+		CollectorID: "ui.org_pat_policy", CapturedBy: "assessor@example.com", CapturedAt: orgMetadata.CollectedAt,
+		Fields: map[string]any{"fine_grained_requires_approval": true, "classic_restricted": true, "max_lifetime_days": float64(90)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SaveJSON(orgRaw, orgMetadata); err != nil {
+		t.Fatal(err)
+	}
+
+	report := &VerticalSliceReport{Metrics: map[string]Metric{}, Outcomes: []CollectorOutcome{}}
+	sources := []ImportSource{
+		{CollectorID: "ui.ent_auth", Scope: entScope, Feature: "capture"},
+		{CollectorID: "ui.org_pat_policy", Scope: orgScope, Feature: "capture"},
+		{CollectorID: "ghes.backup", Scope: entScope, Feature: "a-feature-never-imported"},
+	}
+	if err := ApplyNormalizedImports(report, store, fixtureProfileWithDefault(t), sources); err != nil {
+		t.Fatal(err)
+	}
+
+	ssoMode, ok := report.Metrics["sso_mode"]
+	if !ok || ssoMode.Overall.Status != MetricKnown || ssoMode.Overall.Text == nil || *ssoMode.Overall.Text != "saml" {
+		t.Fatalf("expected sso_mode fed into report.Metrics under its exact profile key: %+v", ssoMode)
+	}
+	if ssoMode.PerOrganization[entScope.Key()].Text == nil || *ssoMode.PerOrganization[entScope.Key()].Text != "saml" {
+		t.Fatalf("expected sso_mode's per-organization entry keyed by the source scope: %+v", ssoMode.PerOrganization)
+	}
+	classicRestricted, ok := report.Metrics["classic_restricted"]
+	if !ok || classicRestricted.Overall.Status != MetricKnown || classicRestricted.Overall.Boolean == nil || !*classicRestricted.Overall.Boolean {
+		t.Fatalf("expected classic_restricted fed into report.Metrics under its exact profile key: %+v", classicRestricted)
+	}
+	maxLifetime, ok := report.Metrics["max_lifetime_days"]
+	if !ok || maxLifetime.Overall.Status != MetricKnown || maxLifetime.Overall.Number == nil || *maxLifetime.Overall.Number != 90 {
+		t.Fatalf("expected max_lifetime_days fed into report.Metrics under its exact profile key: %+v", maxLifetime)
+	}
+
+	// ghes.backup had no actual import at that scope/feature: its outcome
+	// must still be recorded (NotRun, never silently skipped), and EVERY
+	// one of its documented metric keys must still appear -- as an explicit
+	// MetricUnavailable with a semantic reason, never silently absent
+	// (which would be indistinguishable from "this metric was never
+	// requested at all") and never a fabricated known value either.
+	foundGHESBackupOutcome := false
+	for _, outcome := range report.Outcomes {
+		if outcome.CollectorID == "ghes.backup" {
+			foundGHESBackupOutcome = true
+			if outcome.Status != NotRun {
+				t.Fatalf("expected the missing ghes.backup import to report an explicit not-run outcome: %+v", outcome)
+			}
+		}
+		if len(outcome.EvidenceRefs) != 0 && (outcome.EvidenceRefs[0] == "" || outcome.EvidenceRefs[1] == "") {
+			t.Fatalf("expected real, non-empty immutable evidence refs on a successful import outcome: %+v", outcome)
+		}
+	}
+	if !foundGHESBackupOutcome {
+		t.Fatal("expected an outcome recorded even for the collector whose import was never found")
+	}
+	backupSchedule, ok := report.Metrics["backup_schedule"]
+	if !ok {
+		t.Fatal("expected backup_schedule to still appear (as unavailable), never silently absent for a missing source")
+	}
+	if backupSchedule.Overall.Status != MetricUnavailable || backupSchedule.Overall.Reason == "" {
+		t.Fatalf("expected backup_schedule to be an explicit unavailable result with a semantic reason, "+
+			"never a fabricated known value: %+v", backupSchedule.Overall)
+	}
+}
+
+// TestApplyNormalizedImportsRejectsASecondSourceForTheSameCollector proves
+// the disclosed single-source-per-collector boundary is enforced, not
+// silently overwritten (which would lose the first organization's
+// per-organization value when setMetric resets PerOrganization).
+func TestApplyNormalizedImportsRejectsASecondSourceForTheSameCollector(t *testing.T) {
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	report := &VerticalSliceReport{Metrics: map[string]Metric{}, Outcomes: []CollectorOutcome{}}
+	sources := []ImportSource{
+		{CollectorID: "ui.org_pat_policy", Scope: Scope{Host: "github.com", Kind: OrganizationScope, Name: "org-a"}, Feature: "capture"},
+		{CollectorID: "ui.org_pat_policy", Scope: Scope{Host: "github.com", Kind: OrganizationScope, Name: "org-b"}, Feature: "capture"},
+	}
+	if err := ApplyNormalizedImports(report, store, fixtureProfileWithDefault(t), sources); err == nil {
+		t.Fatal("expected a second source for an already-merged collector ID to be rejected, not silently overwritten")
+	}
+}
+
+// TestApplyNormalizedImportsRejectsUnsupportedCollector confirms a
+// collector this round does not normalize (even a genuine import-contract
+// collector ID) is rejected rather than silently ignored or treated as
+// complete.
+func TestApplyNormalizedImportsRejectsUnsupportedCollector(t *testing.T) {
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	report := &VerticalSliceReport{Metrics: map[string]Metric{}, Outcomes: []CollectorOutcome{}}
+	sources := []ImportSource{{CollectorID: "ui.org_actions_settings", Scope: Scope{Host: "github.com", Kind: OrganizationScope, Name: "org-a"}, Feature: "capture"}}
+	if err := ApplyNormalizedImports(report, store, fixtureProfileWithDefault(t), sources); err == nil {
+		t.Fatal("expected an unsupported collector ID to be rejected, not silently ignored")
+	}
+}
+
+// TestNormalizedImportMetricKeysEnumeratesExactSupportedCollectors confirms
+// the discoverable supported/unsupported boundary: a collector this round
+// normalizes reports its exact keys, and a collector outside that set
+// (including an otherwise-valid import-contract collector) reports false,
+// never a fabricated empty-but-present key list.
+func TestNormalizedImportMetricKeysEnumeratesExactSupportedCollectors(t *testing.T) {
+	keys, ok := NormalizedImportMetricKeys("ghes.backup")
+	if !ok || len(keys) != 4 {
+		t.Fatalf("expected ghes.backup's exact 4 documented keys: %+v", keys)
+	}
+	if _, ok := NormalizedImportMetricKeys("ui.org_actions_settings"); ok {
+		t.Fatal("expected a collector this round does not normalize to report false, not a fabricated key list")
+	}
+}
+
+// mainImportedBackupFixture migrates main's own read-only review fixture
+// helper verbatim (adjusted only for the profile parameter this round's
+// fix added): a genuine ghes.backup import, with an explicit Complete flag
+// so both the confident and recorded-incomplete cases can be exercised.
+func mainImportedBackupFixture(t *testing.T, store *EvidenceStore, complete bool) ImportSource {
+	t.Helper()
+	profile := fixtureProfileWithDefault(t)
+	scope := Scope{Host: "ghes.example.com", Kind: EnterpriseScope, Name: "fixture-enterprise"}
+	metadata := EvidenceMetadata{
+		SchemaVersion: "1", ProfileVersion: profile.Version, ProfileSHA256: profile.SHA256,
+		CollectorID: "ghes.backup", Scope: scope, Feature: "capture", SourceKind: ImportedEvidence,
+		CredentialKind: NoCredential, CollectedAt: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC),
+		Endpoint: "import://fixture/backup", Pages: 1, Complete: complete,
+	}
+	if _, err := store.SaveJSON([]byte(`{"captured_at":"2026-10-01T12:00:00Z","schedule_cron_expression":"0 2 * * *","retained_snapshots":10,"encrypted":true}`), metadata); err != nil {
+		t.Fatal(err)
+	}
+	return ImportSource{CollectorID: "ghes.backup", Scope: scope, Feature: "capture"}
+}
+
+// TestMainNormalizedImportsBindEveryMetricToItsRawPair is main's own
+// confirmed reproduction, migrated permanently: a known imported metric's
+// Overall and PerOrganization EvidenceRefs must match the actual
+// outcome's own immutable raw/metadata pair, never reported empty despite
+// a genuine evidence pair existing.
+func TestMainNormalizedImportsBindEveryMetricToItsRawPair(t *testing.T) {
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	source := mainImportedBackupFixture(t, store, true)
+	report := &VerticalSliceReport{Metrics: map[string]Metric{}}
+	if err := ApplyNormalizedImports(report, store, fixtureProfileWithDefault(t), []ImportSource{source}); err != nil {
+		t.Fatal(err)
+	}
+	want := report.Outcomes[0].EvidenceRefs
+	metric := report.Metrics["backup_encrypted"]
+	if len(want) != 2 || !reflect.DeepEqual(metric.Overall.EvidenceRefs, want) ||
+		!reflect.DeepEqual(metric.PerOrganization[source.Scope.Key()].EvidenceRefs, want) {
+		t.Fatalf("known imported metric lost its actual raw/metadata pair: %+v; outcome refs=%v", metric, want)
+	}
+}
+
+// TestMainNormalizedImportsDoNotSilentlyOverwritePriorObservation is main's
+// own confirmed reproduction, migrated permanently: a new imported
+// observation must never silently overwrite an already-known metric
+// (whether from a live collector or an earlier merge).
+func TestMainNormalizedImportsDoNotSilentlyOverwritePriorObservation(t *testing.T) {
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	source := mainImportedBackupFixture(t, store, true)
+	value := false
+	original := Metric{Key: "backup_encrypted", Overall: MetricValue{Status: MetricKnown, Boolean: &value, EvidenceRefs: []string{"earlier-source"}}}
+	report := &VerticalSliceReport{Metrics: map[string]Metric{"backup_encrypted": original}}
+	if err := ApplyNormalizedImports(report, store, fixtureProfileWithDefault(t), []ImportSource{source}); err == nil {
+		t.Fatal("new imported observation silently overwrote a known earlier source")
+	}
+	if !reflect.DeepEqual(report.Metrics["backup_encrypted"], original) {
+		t.Fatal("rejected collision changed the original observation")
+	}
+}
+
+// TestMainNormalizedImportsRejectIncompleteAndUnvalidatedSource is main's
+// own confirmed reproduction, migrated permanently: evidence recorded
+// Complete:false at import time must never yield a confidently known
+// imported setting, and stored evidence that no longer satisfies its own
+// import contract (a required field since gone missing) must be rejected
+// by the loader, exactly as actual ImportJSON validation would reject it.
+func TestMainNormalizedImportsRejectIncompleteAndUnvalidatedSource(t *testing.T) {
+	t.Run("incomplete source", func(t *testing.T) {
+		store := evidenceFixtureStore(t, t.TempDir(), nil)
+		source := mainImportedBackupFixture(t, store, false)
+		report := &VerticalSliceReport{Metrics: map[string]Metric{}}
+		err := ApplyNormalizedImports(report, store, fixtureProfileWithDefault(t), []ImportSource{source})
+		if err == nil && report.Metrics["backup_encrypted"].Overall.Status == MetricKnown {
+			t.Fatal("incomplete evidence produced a confidently known imported setting")
+		}
+	})
+	t.Run("invalid envelope", func(t *testing.T) {
+		store := evidenceFixtureStore(t, t.TempDir(), nil)
+		source := mainImportedBackupFixture(t, store, true)
+		raw, metadata, _, err := store.LoadJSON(source.Scope, source.CollectorID, source.Feature)
+		if err != nil || len(raw) == 0 {
+			t.Fatalf("fixture read failed: %v", err)
+		}
+		if _, err := store.SaveJSON([]byte(`{"encrypted":true}`), metadata); err != nil {
+			t.Fatal(err)
+		}
+		if _, outcome, err := LoadNormalizedGHESBackupImport(store, fixtureProfileWithDefault(t), source.Scope, source.Feature); err == nil && outcome.Status == CollectionOK {
+			t.Fatal("source loader accepted an envelope that actual ImportJSON contract validation would reject")
+		}
+	})
+}
+
+// TestMainNormalizedImportsRejectsUnusableSourcesWithoutPartialMutation is
+// main's own confirmed reproduction, migrated permanently: rejecting an
+// unsupported second source must never leave a partially mutated report
+// behind from the first, otherwise-valid source.
+func TestMainNormalizedImportsRejectsUnusableSourcesWithoutPartialMutation(t *testing.T) {
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	source := mainImportedBackupFixture(t, store, true)
+	source2 := source
+	source2.CollectorID = "ui.org_actions_settings"
+	report := &VerticalSliceReport{Metrics: map[string]Metric{}}
+	if err := ApplyNormalizedImports(report, store, fixtureProfileWithDefault(t), []ImportSource{source, source2}); err == nil {
+		t.Fatal("unsupported second source should be rejected")
+	}
+	if len(report.Metrics) != 0 || len(report.Outcomes) != 0 {
+		t.Fatal("rejected multi-source merge left a partially mutated report")
 	}
 }

@@ -186,3 +186,39 @@ func TestSecurityConfigurationIDsRemainHostQualified(t *testing.T) {
 		t.Fatalf("configuration IDs collided across hosts: %+v %v", value, err)
 	}
 }
+
+// TestSecurityConfigurationCoverageHonorsPerRepositoryRequiredFeatures proves
+// a repository with its own narrower RequiredFeatures (for example a
+// repository CONFIRMED non-eligible for a language-gated feature such as
+// code_scanning_default_setup) is judged against only its own policy, never
+// demanding a feature it could never plausibly carry, while a repository
+// that does not set RequiredFeatures still falls back to the function-wide
+// default policy unchanged.
+func TestSecurityConfigurationCoverageHonorsPerRepositoryRequiredFeatures(t *testing.T) {
+	yes, no := true, false
+	narrowed := securityRepository("codeql-ineligible", &yes, nil)
+	narrowed.RequiredFeatures = []string{"secret_scanning", "dependabot_alerts"}
+	usesDefault := securityRepository("fully-eligible", &yes, nil)
+	repositories := []SecurityRepositoryObservation{narrowed, usesDefault}
+	configurations := []SecurityConfigurationObservation{{
+		Host: "github.com", ID: 20, Enforcement: "enforced",
+		Features: map[string]*bool{"secret_scanning": &yes, "dependabot_alerts": &yes, "code_scanning_default_setup": &no},
+	}}
+	attachments := []SecurityAttachmentObservation{
+		{Repository: narrowed.Scope, ConfigurationID: 20, Status: "attached"},
+		{Repository: usesDefault.Scope, ConfigurationID: 20, Status: "attached"},
+	}
+	required := []string{"secret_scanning", "dependabot_alerts", "code_scanning_default_setup"}
+	value, err := SecurityConfigurationCoverage(repositories, configurations, attachments, required, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if value.Number == nil || *value.Number != 50 {
+		t.Fatalf("expected exactly the narrowed repository to count as covered (50%%), got %+v", value)
+	}
+
+	narrowed.RequiredFeatures = []string{}
+	if _, err := SecurityConfigurationCoverage([]SecurityRepositoryObservation{narrowed, usesDefault}, configurations, attachments, required, true); err == nil {
+		t.Fatal("an explicitly empty per-repository RequiredFeatures override was accepted instead of rejected")
+	}
+}

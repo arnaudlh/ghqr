@@ -1,7 +1,8 @@
 # Assessment collection and evidence contract
 
-The safety/evidence layer supports the separate `ghqr assess` workflow, not a
-complete scored assessment. The Phase 4 adapter follow-up has **50 run-wired
+The safety/evidence layer supports the separate `ghqr assess` workflow, with a
+limited typed evaluation and export pipeline rather than complete automation
+of the assessment profile. The adapter follow-up has **50 run-wired
 collector IDs**, **16 import-only contracts**, **one preflight-only probe**
 (`ghes.meta`). Every catalogue ID has a declared path. A registered ID means that
 at least one real feature is wired; it does not mean every endpoint or metric in
@@ -14,9 +15,11 @@ Its `implemented_collectors` metadata lists all 51 adapters/probes, while
 `not-checked`; readiness alone never yields a score or an evidence reference.
 Probe coverage, adapter readiness, observed permission and collection
 completeness are distinct; absence of a preflight probe is not proof of absence
-of a collection adapter. No evaluator is included in this published increment.
-Full control evaluation and raw-evidence-to-analysis replay remain later
-milestones.
+of a collection adapter. The typed registry has **15 evaluators**; the other
+**244 Full/Partial controls** remain explicitly `NOT_ASSESSED`. All 456 result
+rows and 581 metric keys are export contracts, not proof of evaluator coverage.
+The official framework governs intent; profile thresholds are versioned
+offering policy, not universal GitHub mandates.
 
 | Run-wired group | Exact collector IDs |
 | --- | --- |
@@ -87,9 +90,40 @@ proof of every user's real activity. Enterprise policies preserve literal
 `NO_POLICY` rather than coercing it to false. Missing totals/amounts and malformed
 records remain unknown or incomplete with explicit outcome reasons.
 
-Import-only UI/external interiors and the partial features above remain distinct
-from complete normalized collectors. Catalogue-ID coverage does not establish
-coverage of all profile metrics, evaluator rules or live tenant permissions.
+Three import contracts have field normalization: `ghes.backup` (four metric
+keys), `ui.ent_auth` (three), and `ui.org_pat_policy` (three). The other
+UI/external interiors remain generic envelope contracts, not fully normalized
+collectors. Enterprise-wide configuration attachment coverage and an
+immutable-pair `ImportSource` selector remain unsupported. Explicit logical
+scope/collector/feature selectors resolve the store's current reference;
+returned evidence pairs are immutable, but the selector itself is not a
+historical snapshot. Catalogue-ID coverage does not establish coverage of all
+profile metrics, evaluator rules or live tenant permissions.
+
+`assess evaluate` requires an explicit output directory and either an evidence
+directory for verification or explicit `--allow-unverified` consent, never both.
+Unverified consent does not bypass scope authorization. Existing canonical
+results require explicit overwrite consent. Verification mode and source
+collection outcomes are persisted for later assessor confirmation; a
+confirmation is a separate decision, not a change to measured observations.
+Raw verification reconstructs analysis through the same collection pipeline
+against cited immutable evidence and collection context, not current logical
+pointers or supplied derived values alone.
+
+Contexts lacking a bound original outcome inventory cannot earn full
+verification. Adding normalized imports after the original run also changes
+that inventory: source-verified evaluation refuses this augmentation in the
+limited release instead of silently treating it as original collected data.
+Such reports require explicit unverified consent; normalized-import replay
+augmentation is not implemented. Imported raw pairs retain their bare feature
+identity and are not misrepresented as REST-paginated pages.
+
+Feature acceptance distinguishes `LivePass`, `FixturePass`, `Blocked`,
+`NotApplicable`, and `Untested`. A feature executing correctly does not mean
+the customer's control is compliant. Deployment-specific modes, safety
+negatives and manual inputs use separate fixtures; synthetic evidence and
+assessor decisions must not enter customer results. A synthetic 50-repository
+test is not a live production benchmark.
 
 ## Explicit scope and live consent
 
@@ -107,6 +141,13 @@ Cloud and GHES REST routes differ from GraphQL and GHES management routes.
 Management uses TLS on port 8443, `/manage/v1/`, and its separate Basic username
 and password references, never a PAT routed through `/api/v3`.
 
+API credential provenance distinguishes `classic-pat`, `fine-grained-pat`,
+`app-installation`, and `oauth-user`. An OAuth user credential uses the same
+read-only Bearer transport but is never relabeled as a classic PAT. Configure
+only its environment reference, for example
+`credentials: {kind: oauth-user, token_env: ASSESS_TOKEN}`; account selection and
+authorization remain the operator's responsibility.
+
 SCIM is opt-in through `scim_mode`, independently for each target:
 
 | Mode | Platform/scope | Read-only endpoint |
@@ -116,8 +157,9 @@ SCIM is opt-in through `scim_mode`, independently for each target:
 | `ghes` | Server, appliance-wide; no enterprise slug required | `/api/v3/scim/v2/Users` |
 
 An empty mode is not run; SAML presence never implies EMU. SCIM requires an
-explicit classic-PAT credential route, not a fine-grained PAT, App token or
-global credential fallback. Required scopes differ by platform and actor
+explicit classic-PAT credential route, not a fine-grained PAT, OAuth user
+credential, App token or global credential fallback. Required scopes differ by
+platform and actor
 (`scim:enterprise` for setup/GHES; Cloud enterprise-owner read access can use
 `admin:enterprise`). An organization-only SAML target or GHES appliance does not
 need a fabricated enterprise slug. Index/count pagination validates the server's

@@ -324,9 +324,9 @@ func validateTarget(target Target) error {
 
 func validateCredentials(refs CredentialReferences) error {
 	switch refs.Kind {
-	case "", NoCredential, ClassicPAT, FineGrainedPAT, AppInstallation:
+	case "", NoCredential, ClassicPAT, FineGrainedPAT, AppInstallation, OAuthUser:
 	default:
-		return fmt.Errorf("API credential kind must be none, classic-pat, fine-grained-pat or app-installation")
+		return fmt.Errorf("API credential kind must be none, classic-pat, fine-grained-pat, app-installation or oauth-user")
 	}
 	if (refs.Kind == "" || refs.Kind == NoCredential) && refs.TokenEnv != "" {
 		return fmt.Errorf("token reference requires an explicit credential kind")

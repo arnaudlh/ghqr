@@ -202,7 +202,7 @@ func validateEvidenceMetadata(metadata EvidenceMetadata) error {
 		return fmt.Errorf("evidence source provenance is required")
 	}
 	switch metadata.CredentialKind {
-	case NoCredential, ClassicPAT, FineGrainedPAT, AppInstallation, ManagementConsole:
+	case NoCredential, ClassicPAT, FineGrainedPAT, AppInstallation, OAuthUser, ManagementConsole:
 	default:
 		return fmt.Errorf("unknown evidence credential kind")
 	}

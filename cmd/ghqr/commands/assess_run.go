@@ -36,6 +36,10 @@ func addAssessmentRunCommand(command *cobra.Command, profilePath, configPath *st
 			if err != nil {
 				return err
 			}
+			// RunVerticalSlice itself captures and binds this run's
+			// immutable, non-secret collection-time context (report.ContextRef)
+			// as part of its own success contract; this CLI layer no longer
+			// needs (or should attempt) a separate post-run write.
 			report, err := assessment.RunVerticalSlice(cmd.Context(), profile, config)
 			if err != nil {
 				return err

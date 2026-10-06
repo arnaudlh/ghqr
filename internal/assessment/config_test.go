@@ -34,6 +34,7 @@ func TestCustomerConfig(t *testing.T) {
 		{"signed impossible reduction", "organizations: [acme]\nthresholds: {open_alerts_trend_90d_pct: -100.01}", "at least -100"},
 		{"inline secret", "organizations: [acme]\ncredentials: {token: sensitive-placeholder}", "decode customer configuration"},
 		{"secret as reference", "organizations: [acme]\ncredentials: {kind: classic-pat, token_env: 'not/an/env'}", "variable names"},
+		{"oauth user credential kind valid", "organizations: [acme]\ncredentials: {kind: oauth-user, token_env: FIXTURE_OAUTH_TOKEN}", ""},
 		{"partial management reference", "organizations: [acme]\ncredentials: {management_password_env: GHES_PASSWORD}", "both username and password"},
 		{"management token confusion", "organizations: [acme]\ncredentials: {kind: management-console}", "API credential kind"},
 		{"mixed implicit hosts", "deployment: both\norganizations: [acme]", "requires explicit targets"},

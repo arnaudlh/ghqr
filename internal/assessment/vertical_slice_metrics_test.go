@@ -484,3 +484,88 @@ func TestPopulateAccessMetricsTeamBasedAccessPctIsGrantCountRatioNotRepoPresence
 		}
 	})
 }
+
+// TestPopulateSecurityConfigCoverageUnknownOrganizationCannotProduceKnownSubset
+// is a regression test: the pooled code_security_configuration_full_coverage_pct
+// previously treated ANY non-MetricKnown organization result (including a
+// genuinely unresolved one) by simply excluding it from the numerator/
+// denominator sum, while separately forcing the overall Status to
+// MetricUnavailable with Number/Numerator/Denominator all erased to nil --
+// collapsing the confidently-known subset's own retained counts entirely,
+// the same "unknown peer silently excluded" defect this package's
+// cohortCoverageMetric helper already exists to prevent for CodeQL/
+// Dependency/attestation coverage. One organization whose own coverage is
+// confidently known (1/2) alongside one whose coverage could not be
+// determined at all must report the pooled Overall as MetricUnavailable
+// with Number:nil, while still retaining the known organization's own 1/2
+// counts on the pooled Numerator/Denominator (never silently reporting a
+// confident 50%, and never erasing the retained counts either).
+func TestPopulateSecurityConfigCoverageUnknownOrganizationCannotProduceKnownSubset(t *testing.T) {
+	numerator, denominator := 1.0, 2.0
+	accumulator := newMetricAccumulator()
+	accumulator.addSecurityConfigCoverage("github.com/organization/known", MetricValue{
+		Status: MetricKnown, Number: floatPointer(50), Numerator: &numerator, Denominator: &denominator,
+		Population: "configuration-eligible repositories", EvidenceRefs: []string{},
+	})
+	accumulator.addSecurityConfigCoverage("github.com/organization/unresolved", MetricValue{
+		Status: MetricUnavailable, Population: "configuration-eligible repositories", EvidenceRefs: []string{},
+		Reason: "configuration or attachment inventory is incomplete",
+	})
+
+	metrics := map[string]Metric{}
+	accumulator.populateSecurityConfigCoverage(metrics)
+
+	overall := metrics["code_security_configuration_full_coverage_pct"].Overall
+	if overall.Status != MetricUnavailable {
+		t.Fatalf("one genuinely unresolved organization must make the pooled overall unavailable, never a silently "+
+			"computed subset percentage: %+v", overall)
+	}
+	if overall.Number != nil {
+		t.Fatalf("an unavailable pooled metric must not carry a Number: %+v", overall)
+	}
+	if overall.Numerator == nil || overall.Denominator == nil || *overall.Numerator != 1 || *overall.Denominator != 2 {
+		t.Fatalf("the confidently-known organization's own 1/2 counts must still be retained on the pooled metric, "+
+			"not erased to nil: %+v", overall)
+	}
+	if overall.Reason == "" {
+		t.Fatal("expected an explicit disclosed Reason for the unavailable pooled metric")
+	}
+	known := metrics["code_security_configuration_full_coverage_pct"].PerOrganization["github.com/organization/known"]
+	if known.Status != MetricKnown || known.Number == nil || *known.Number != 50 {
+		t.Fatalf("the resolved organization's own per-organization value must remain its true known 50%%, "+
+			"unaffected by the unresolved peer: %+v", known)
+	}
+}
+
+// TestPopulateSecurityConfigCoverageConfirmedEmptyOrganizationDoesNotForceUnavailable
+// is the sibling confirming a confirmed, zero-eligible-repository
+// organization (MetricInapplicable -- a genuine, resolved "nothing to
+// measure here", not an unresolved peer) does not, on its own, force the
+// pooled overall unavailable: pooled with one other organization whose own
+// coverage is fully known, the overall must report that organization's
+// true known percentage.
+func TestPopulateSecurityConfigCoverageConfirmedEmptyOrganizationDoesNotForceUnavailable(t *testing.T) {
+	numerator, denominator := 1.0, 1.0
+	accumulator := newMetricAccumulator()
+	accumulator.addSecurityConfigCoverage("github.com/organization/known", MetricValue{
+		Status: MetricKnown, Number: floatPointer(100), Numerator: &numerator, Denominator: &denominator,
+		Population: "configuration-eligible repositories", EvidenceRefs: []string{},
+	})
+	accumulator.addSecurityConfigCoverage("github.com/organization/empty", MetricValue{
+		Status: MetricInapplicable, Population: "configuration-eligible repositories", EvidenceRefs: []string{},
+		Reason: "complete population contains no eligible repositories",
+	})
+
+	metrics := map[string]Metric{}
+	accumulator.populateSecurityConfigCoverage(metrics)
+
+	overall := metrics["code_security_configuration_full_coverage_pct"].Overall
+	if overall.Status != MetricKnown || overall.Number == nil || *overall.Number != 100 {
+		t.Fatalf("a confirmed-empty peer organization must not force the pooled overall unavailable, nor dilute "+
+			"the other organization's true known 100%%: %+v", overall)
+	}
+}
+
+func floatPointer(value float64) *float64 {
+	return &value
+}

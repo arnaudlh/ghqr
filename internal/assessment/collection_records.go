@@ -82,3 +82,10 @@ func collectJSONArray[T any](ctx context.Context, client *CollectionClient, stor
 func pageFeatureName(feature string, page int) string {
 	return fmt.Sprintf("%s-page-%06d", feature, page)
 }
+
+// boolPtr returns a pointer to a bool literal, for EvidenceMetadata's
+// tri-state PaginationContinues field (true/false/nil are all distinct and
+// meaningful there, so a plain bool cannot express it).
+func boolPtr(value bool) *bool {
+	return &value
+}
