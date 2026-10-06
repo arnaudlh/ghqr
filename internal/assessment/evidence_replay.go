@@ -52,8 +52,17 @@ func (f frozenClock) Sleep(_ context.Context, _ time.Duration) error { return ni
 // before any field derived from a real credential (c.http's transport,
 // c.base) is ever read for an outbound request, so no actual
 // token/username/password value is ever resolved or needed regardless of
-// which credentialKind is preserved.
-func NewReplayCollectionClient(target Target, source EvidenceSource, profile *Profile, replaySource *EvidenceStore, clock Clock) (*CollectionClient, error) {
+// which credentialKind is preserved. originalOutcomes, when non-nil, is the
+// bound, trusted original CollectorOutcome inventory keyed by
+// outcomeIdentityKey -- consulted only by collectFromReplay's own "ran out
+// of stored pages" fallthrough (see that function's own doc) to faithfully
+// reproduce a genuinely partial/incomplete outcome's own terminal state,
+// rather than silently upgrading it to a clean finish merely because the
+// replay source has nothing stored beyond whatever page the original run
+// itself genuinely stopped at; nil is a safe, fully backward-compatible
+// default (the prior, pre-this-mechanism behavior) for a caller with no
+// such inventory available.
+func NewReplayCollectionClient(target Target, source EvidenceSource, profile *Profile, replaySource *EvidenceStore, clock Clock, originalOutcomes map[string]CollectorOutcome) (*CollectionClient, error) {
 	if replaySource == nil {
 		return nil, fmt.Errorf("replay collection client requires a replay evidence source")
 	}
@@ -89,6 +98,7 @@ func NewReplayCollectionClient(target Target, source EvidenceSource, profile *Pr
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
 		base: base, source: source, credentialKind: kind,
 		profile: profile, clock: clock, redactor: NewRedactor(), replaySource: replaySource,
+		originalOutcomes: originalOutcomes,
 	}, nil
 }
 
@@ -103,9 +113,12 @@ func NewReplayCollectionClient(target Target, source EvidenceSource, profile *Pr
 // c.clock at all, copying each page's original CollectedAt verbatim
 // instead of re-stamping it), so this is current pure defense-in-depth
 // consistency, not something any collection timing presently depends on.
-func newReplayClientFactory(profile *Profile, replaySource *EvidenceStore, clock Clock) func(Target, EvidenceSource) (*CollectionClient, error) {
+// originalOutcomes is passed straight through to every client this factory
+// constructs (every target/source combination shares the SAME bound
+// inventory for this one replay run).
+func newReplayClientFactory(profile *Profile, replaySource *EvidenceStore, clock Clock, originalOutcomes map[string]CollectorOutcome) func(Target, EvidenceSource) (*CollectionClient, error) {
 	return func(target Target, source EvidenceSource) (*CollectionClient, error) {
-		return NewReplayCollectionClient(target, source, profile, replaySource, clock)
+		return NewReplayCollectionClient(target, source, profile, replaySource, clock, originalOutcomes)
 	}
 }
 
@@ -691,8 +704,23 @@ func ReplayVerticalSlice(ctx context.Context, profile *Profile, report *Vertical
 		at = time.Now().UTC()
 	}
 	frozen := frozenClock{at: at}
+	// originalOutcomesByIdentity is built ONLY from the bound, trusted
+	// context inventory (never the claim itself, even though the two are
+	// already proven identical by this point when context-bound -- using
+	// the trusted source directly here is defense in depth against any
+	// future change accidentally reordering that check past this point).
+	// nil for a non-context-bound (legacy/best-effort) replay: there is no
+	// trusted original-outcome source to consult there, matching that
+	// path's existing never-AnalysisVerified=true limitation.
+	var originalOutcomesByIdentity map[string]CollectorOutcome
+	if contextBound && len(runContext.OriginalOutcomes) > 0 {
+		originalOutcomesByIdentity = make(map[string]CollectorOutcome, len(runContext.OriginalOutcomes))
+		for _, outcome := range runContext.OriginalOutcomes {
+			originalOutcomesByIdentity[outcomeIdentityKey(outcome.Scope, outcome.CollectorID, outcome.Feature)] = outcome
+		}
+	}
 	replayed, runErr := runVerticalSliceWithStore(ctx, profile, config, targets, scratchStore, frozen,
-		newReplayClientFactory(profile, exactSource, frozen))
+		newReplayClientFactory(profile, exactSource, frozen, originalOutcomesByIdentity))
 	return replayed, contextBound, runErr
 }
 
@@ -820,12 +848,12 @@ func materializeExactReplaySource(originalSource *EvidenceStore, profile *Profil
 				}
 				lastPageMetadata = metadata
 			}
-			if !pageProvablyTerminal(lastPageMetadata.PaginationContinues) {
-				return nil, fmt.Errorf("%s/%s (%s): the last logically-resolved page's own recorded metadata "+
-					"does not prove this organization/collector/feature's pagination had actually finished at "+
-					"page %d (missing/unparseable terminal proof is never treated as confirmed termination); "+
-					"refusing to seed a truncated replay source", outcome.CollectorID, outcome.Feature,
-					outcome.Scope.Key(), outcome.Pages)
+			if outcome.Status == CollectionOK && outcome.Complete && !pageProvablyTerminal(lastPageMetadata.PaginationContinues) {
+				return nil, fmt.Errorf("%s/%s (%s): this outcome claims a clean, complete finish, but the last "+
+					"logically-resolved page's own recorded metadata does not prove this organization/collector/"+
+					"feature's pagination had actually finished at page %d (missing/unparseable terminal proof "+
+					"is never treated as confirmed termination); refusing to seed a truncated replay source as "+
+					"if it were genuinely complete", outcome.CollectorID, outcome.Feature, outcome.Scope.Key(), outcome.Pages)
 			}
 			continue
 		}
@@ -887,31 +915,42 @@ func materializeExactReplaySource(originalSource *EvidenceStore, profile *Profil
 		// exempt from this specific check, never required to carry proof
 		// no import mechanism produces in the first place.
 		if outcome.Readiness != ImportOnly {
-			// Terminal-pagination proof: CollectGET's own pagination loop only
-			// ever exits cleanly (without an early return/break on failure) when
-			// the fetched page's own response carried no valid next link, so a
-			// genuine outcome's LAST page always has PaginationContinues
-			// confidently false, unconditionally -- regardless of whatever
-			// Status/Complete this outcome itself goes on to claim. Anything
-			// other than a confident false -- a confident true (a valid next
-			// link was genuinely found), OR nil (unknown: a pre-this-field
-			// legacy page, or one whose Link header could not even be parsed,
-			// which still often indicates the server WAS trying to express a
-			// next link) -- means this specific page cannot be trusted as
-			// proof pagination genuinely ended here, from that page's own
+			// Terminal-pagination proof is required ONLY when this outcome
+			// itself claims a clean, complete finish (Status:CollectionOK,
+			// Complete:true): CollectGET's own pagination loop only ever
+			// exits THAT way when the fetched page's own response carried
+			// no valid next link, so a genuine clean-complete claim's LAST
+			// page always has PaginationContinues confidently false,
+			// unconditionally. Anything other than a confident false -- a
+			// confident true (a valid next link was genuinely found), OR
+			// nil (unknown: a pre-this-field legacy page, or one whose Link
+			// header could not even be parsed, which still often indicates
+			// the server WAS trying to express a next link) -- means this
+			// specific page cannot be trusted as proof pagination genuinely
+			// ended here for a CLEAN-COMPLETE claim, from that page's own
 			// immutable, content-addressed metadata (never a directory-
 			// presence/page-count heuristic, which cannot distinguish a
 			// genuinely truncated claim from this same logical key's own
-			// unrelated sibling run). pageProvablyTerminal is the one and only
-			// gate for "this page's own claim to be the end of pagination may
-			// be trusted"; nil is never silently equivalent to a confirmed
-			// false.
-			if outcome.Pages > 0 && !pageProvablyTerminal(lastPageMetadata.PaginationContinues) {
-				return nil, fmt.Errorf("%s/%s (%s): the last cited page's own recorded metadata does not prove this "+
-					"organization/collector/feature's pagination had actually finished at page %d -- missing/"+
-					"unparseable terminal proof is never treated as confirmed termination, so this outcome's own "+
-					"claimed page count cannot be trusted as complete; refusing to seed a truncated replay source",
-					outcome.CollectorID, outcome.Feature, outcome.Scope.Key(), outcome.Pages)
+			// unrelated sibling run). pageProvablyTerminal is the one and
+			// only gate for "this page's own claim to be the end of
+			// pagination may be trusted"; nil is never silently equivalent
+			// to a confirmed false. An outcome that HONESTLY claims
+			// Partial/incomplete (for example a genuine invalid/malformed
+			// next-link error, or a denied subsequent page) is not making
+			// any clean-finish claim this mechanism needs to corroborate --
+			// it is already disclosing its own incompleteness, so it is
+			// exempt from this specific check and reconstructed faithfully
+			// as the genuine partial result it claims to be, never upgraded
+			// and never rejected for lacking proof of something it never
+			// claimed in the first place.
+			if outcome.Pages > 0 && outcome.Status == CollectionOK && outcome.Complete &&
+				!pageProvablyTerminal(lastPageMetadata.PaginationContinues) {
+				return nil, fmt.Errorf("%s/%s (%s): this outcome claims a clean, complete finish, but the last "+
+					"cited page's own recorded metadata does not prove this organization/collector/feature's "+
+					"pagination had actually finished at page %d -- missing/unparseable terminal proof is never "+
+					"treated as confirmed termination, so this outcome's own claimed page count cannot be "+
+					"trusted as complete; refusing to seed a truncated replay source as if it were genuinely "+
+					"complete", outcome.CollectorID, outcome.Feature, outcome.Scope.Key(), outcome.Pages)
 			}
 		}
 	}
@@ -944,6 +983,16 @@ func materializeExactReplaySource(originalSource *EvidenceStore, profile *Profil
 // present in both but differing in ANY field, or an original outcome the
 // claim simply omits, are all reported as mismatches -- a claim must never
 // be allowed to selectively drop or reword a genuinely recorded result. A
+// outcomeIdentityKey is the stable (scope, collectorID, feature) identity
+// key used to match a claimed/replayed/original CollectorOutcome to its
+// counterpart across independently constructed lists -- shared by
+// compareOriginalOutcomes and the replay client's own original-outcome
+// terminal-state lookup (see CollectionClient.originalOutcomes), so both
+// use the exact same identity notion.
+func outcomeIdentityKey(scope Scope, collectorID, feature string) string {
+	return scope.Key() + "/" + collectorID + "/" + feature
+}
+
 // context with no bound OriginalOutcomes at all (nil/empty -- one written
 // before this mechanism existed, or by a caller/test that never captured
 // real outcomes) has nothing to compare against and is never treated as a
@@ -953,7 +1002,7 @@ func compareOriginalOutcomes(claimed, original []CollectorOutcome) []string {
 		return nil
 	}
 	identityKey := func(outcome CollectorOutcome) string {
-		return outcome.Scope.Key() + "/" + outcome.CollectorID + "/" + outcome.Feature
+		return outcomeIdentityKey(outcome.Scope, outcome.CollectorID, outcome.Feature)
 	}
 	originalByKey := make(map[string]CollectorOutcome, len(original))
 	for _, outcome := range original {
@@ -1161,7 +1210,10 @@ func compareOrganizationPopulations(organizationKey string, claimed, replayed *O
 // AuditLog's own RequestedSince/RequestedUntil: a genuine replay reproduces
 // these exactly (see compareTargetOperationalResults' own doc for why), so
 // there is no genuine drift left to except, and a deliberately widened or
-// narrowed claimed lookback window is caught like any other field.
+// narrowed claimed lookback window is caught like any other field. The one
+// deliberate, narrowly-scoped exception is Teams' own nil-vs-empty-slice
+// JSON round-trip artifact -- see normalizeEmptyTeamRoster -- which this
+// still otherwise-full comparison applies before the equality check.
 func compareOrganizationOperational(organizationKey string, claimed, replayed *OrganizationOperationalResult) []string {
 	if claimed == nil {
 		return nil
@@ -1169,11 +1221,39 @@ func compareOrganizationOperational(organizationKey string, claimed, replayed *O
 	if replayed == nil {
 		return []string{fmt.Sprintf("%s: claimed organization-scoped operational results, replay established none at all", organizationKey)}
 	}
-	if reflect.DeepEqual(*claimed, *replayed) {
+	claimedValue, replayedValue := *claimed, *replayed
+	normalizeEmptyTeamRoster(&claimedValue, &replayedValue)
+	if reflect.DeepEqual(claimedValue, replayedValue) {
 		return nil
 	}
 	return []string{fmt.Sprintf(
 		"%s: claimed organization-scoped operational results do not match this run's own independently replayed results", organizationKey)}
+}
+
+// normalizeEmptyTeamRoster closes exactly one JSON-shape artifact on
+// OrganizationOperationalResult.Teams, which carries `omitempty`: a
+// genuinely observed, confirmed-zero-team roster (FetchOrgTeams/
+// collectJSONArray always build a non-nil, zero-length slice for a
+// successful, zero-result page -- never a bare nil, which that function
+// only ever returns on a genuine collection error) serializes identically
+// to an absent field. A saved report decoded back from that exact JSON can
+// therefore only ever read Teams as nil, while this run's own freshly,
+// independently in-memory-collected replay result still holds its original
+// non-nil, zero-length slice -- the exact same roster, the exact same JSON
+// ("teams" key absent either way), differing only in Go's nil-vs-empty-
+// slice representation. This normalizes ONLY that single artifact, and
+// only when both sides already separately agree the roster is zero-length
+// AND their nil-ness itself is what differs (never when one side's
+// length is actually nonzero, which stays a real, uncaught divergence).
+// It carries no bearing on collection completeness: an org.teams collector
+// failure is tracked exclusively by that collector's own CollectorOutcome
+// (Complete/Reason), a wholly separate signal this never touches or
+// relaxes, so an unknown/incomplete team source can never be laundered
+// through this normalization into looking like a confirmed empty roster.
+func normalizeEmptyTeamRoster(claimed, replayed *OrganizationOperationalResult) {
+	if len(claimed.Teams) == 0 && len(replayed.Teams) == 0 && (claimed.Teams == nil) != (replayed.Teams == nil) {
+		claimed.Teams, replayed.Teams = nil, nil
+	}
 }
 
 // compareRepositoryResult compares one repository's claimed vs replayed

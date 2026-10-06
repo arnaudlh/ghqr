@@ -152,6 +152,99 @@ func TestEvidenceFailureLeavesPreviousCompletePair(t *testing.T) {
 	}
 }
 
+// TestSaveJSONRedactionAppendIsIdempotentAcrossResaves proves the exact
+// regression a parent-reported duplicate-EvidenceRefs finding root-caused:
+// SaveJSON blindly appended this call's freshly-rediscovered redaction
+// paths onto whatever Redactions a caller's metadata already carried
+// forward (for example after round-tripping through LoadJSON before a
+// genuine resave of identical content), so each additional resave of the
+// SAME evidence grew Redactions -- and with it the content-addressed
+// object identity/ref -- forever, even though nothing new was ever
+// actually redacted.
+func TestSaveJSONRedactionAppendIsIdempotentAcrossResaves(t *testing.T) {
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	metadata := evidenceFixtureMetadata(t)
+	raw := []byte(`{"description": "a free-text field that is always wholesale redacted"}`)
+
+	first, err := store.SaveJSON(raw, metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, firstMeta, _, err := store.LoadJSON(metadata.Scope, metadata.CollectorID, metadata.Feature)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(firstMeta.Redactions) == 0 {
+		t.Fatal("fixture raw was not genuinely redacted, so this test proves nothing")
+	}
+
+	// A genuine resave, carrying the already-saved metadata's own
+	// Redactions forward exactly as a caller that round-trips metadata
+	// through LoadJSON/an evidence ref before resaving the identical
+	// content would.
+	resave := metadata
+	resave.Redactions = append([]string{}, firstMeta.Redactions...)
+	second, err := store.SaveJSON(raw, resave)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second != first {
+		t.Fatalf("resaving identical content with carried-forward redactions changed its evidence reference: %+v vs %+v", first, second)
+	}
+	_, secondMeta, _, err := store.LoadJSON(metadata.Scope, metadata.CollectorID, metadata.Feature)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(secondMeta.Redactions) != len(firstMeta.Redactions) {
+		t.Fatalf("redaction history grew across an idempotent resave: first=%d second=%d", len(firstMeta.Redactions), len(secondMeta.Redactions))
+	}
+
+	// A third resave (a "client resave" after that) must still be a no-op.
+	thirdResave := metadata
+	thirdResave.Redactions = append([]string{}, secondMeta.Redactions...)
+	third, err := store.SaveJSON(raw, thirdResave)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third != first {
+		t.Fatalf("a third resave still changed the evidence reference: %+v vs %+v", first, third)
+	}
+}
+
+// TestSaveJSONPreservesExistingDuplicatedRedactionHistoryVerbatim proves
+// the idempotent-append fix is surgical: it never dedupes, reorders, or
+// otherwise rewrites any entry already present in a caller-supplied
+// Redactions history (including a legacy duplicate pair baked in before
+// this safeguard existed) -- it only ever skips re-appending THIS call's
+// own freshly-found paths when they already exactly match the array's own
+// tail, and still appends a genuinely new path discovered on this save.
+func TestSaveJSONPreservesExistingDuplicatedRedactionHistoryVerbatim(t *testing.T) {
+	store := evidenceFixtureStore(t, t.TempDir(), nil)
+	metadata := evidenceFixtureMetadata(t)
+	metadata.Redactions = []string{"$.description", "$.description"}
+	raw := []byte(`{"description": "a free-text field", "comment": "a different free-text field"}`)
+
+	if _, err := store.SaveJSON(raw, metadata); err != nil {
+		t.Fatal(err)
+	}
+	_, saved, _, err := store.LoadJSON(metadata.Scope, metadata.CollectorID, metadata.Feature)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(saved.Redactions) < 2 || saved.Redactions[0] != "$.description" || saved.Redactions[1] != "$.description" {
+		t.Fatalf("pre-existing legacy duplicate redaction history was altered: %v", saved.Redactions)
+	}
+	found := false
+	for _, path := range saved.Redactions[2:] {
+		if path == "$.comment" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("a genuinely new redaction path on this save was not appended: %v", saved.Redactions)
+	}
+}
+
 func TestKnownSecretTextAndBase64ContentAreSanitized(t *testing.T) {
 	redactor := NewRedactor("dummy-sensitive-value")
 	text := redactor.Text("authorization failure: dummy-sensitive-value for person@example.test\nAPI_TOKEN=another-private-value")

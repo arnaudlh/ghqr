@@ -11,6 +11,7 @@ GOLANGCI_LINT := ./bin/golangci-lint
 PRODUCT_VERSION	:= $(if $(PRODUCT_VERSION),$(PRODUCT_VERSION),'0.0.0-dev')
 LDFLAGS	:= -s -w -X github.com/microsoft/ghqr/cmd/ghqr/commands.version=$(PRODUCT_VERSION)
 TRIM_PATH := -trimpath
+GO_TEST_TIMEOUT ?= 20m
 
 all: $(TARGET)
 
@@ -45,7 +46,7 @@ tidy:
 	git diff --exit-code ./go.sum
 
 test: lint vet tidy
-	go test -race ./... -coverprofile=coverage.txt -covermode=atomic
+	go test -race ./... -timeout=$(GO_TEST_TIMEOUT) -coverprofile=coverage.txt -covermode=atomic
 
 $(TARGET): clean
 	CGO_ENABLED=0 go build $(TRIM_PATH) -o $(BIN) -ldflags "$(LDFLAGS)" ./cmd/ghqr/main.go

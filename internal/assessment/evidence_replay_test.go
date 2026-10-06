@@ -41,7 +41,7 @@ func TestReplayClientPreservesCredentialKindForGatedCollectors(t *testing.T) {
 	replaySource := evidenceFixtureStore(t, sourceDir, nil)
 	replayClient, err := NewReplayCollectionClient(
 		Target{Host: liveClient.base.Hostname(), Deployment: Cloud, Credentials: CredentialReferences{Kind: ClassicPAT}},
-		RESTEvidence, liveClient.profile, replaySource, SystemClock{})
+		RESTEvidence, liveClient.profile, replaySource, SystemClock{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestReplayClientPreservesCredentialKindForGatedCollectors(t *testing.T) {
 func TestReplayClientDefaultsUnspecifiedCredentialKindToNoCredential(t *testing.T) {
 	replaySource := evidenceFixtureStore(t, t.TempDir(), nil)
 	client, err := NewReplayCollectionClient(Target{Host: "github.com", Deployment: Cloud}, RESTEvidence,
-		fixtureProfileWithDefault(t), replaySource, SystemClock{})
+		fixtureProfileWithDefault(t), replaySource, SystemClock{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestReplayClientPreservesOAuthUserCredentialKind(t *testing.T) {
 	profile := fixtureProfileWithDefault(t)
 	client, err := NewReplayCollectionClient(
 		Target{Host: "github.com", Deployment: Cloud, Credentials: CredentialReferences{Kind: OAuthUser}},
-		RESTEvidence, profile, store, SystemClock{})
+		RESTEvidence, profile, store, SystemClock{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

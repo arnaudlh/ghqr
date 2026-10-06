@@ -50,6 +50,14 @@ type CollectionClient struct {
 	// path (NewCollectionClient) never populates it, so every existing
 	// caller's behavior is completely unchanged.
 	replaySource *EvidenceStore
+	// originalOutcomes, when non-nil (replay clients only), is the bound,
+	// trusted original CollectorOutcome inventory keyed by
+	// outcomeIdentityKey -- consulted ONLY by collectFromReplay's own
+	// "ran out of stored pages" fallthrough (see that function's own doc),
+	// never mutated and never used to alter any actually-stored page's own
+	// content/metadata. The live collection path (NewCollectionClient)
+	// never populates it.
+	originalOutcomes map[string]CollectorOutcome
 }
 
 // resolveCollectionEndpointAddress computes the base URL (and, for GraphQL,
@@ -342,6 +350,36 @@ func (c *CollectionClient) collectFromReplay(store *EvidenceStore, scope Scope, 
 		}
 		if !paginate {
 			break
+		}
+	}
+	// Reached only when pagination "ran out" of stored pages for a
+	// paginated call (not a page-1 miss, not an incomplete page -- both
+	// already returned above): every page actually found replayed intact
+	// and complete, and there is simply no further page stored beyond this
+	// one. An absence in the replay source alone cannot distinguish two
+	// genuinely different cases that look identical from here: pagination
+	// may have genuinely, cleanly ended at this exact page, OR the
+	// original run's own collection may have failed to continue PAST this
+	// exact page (for example an invalid/malformed next-link, or a denied
+	// follow-up page) while this page itself still replayed fine. The
+	// bound original outcome's own claimed terminal state -- consulted
+	// here, never mutated, never inferred from page counts or directory
+	// presence -- is the one authoritative source for which case this
+	// actually was: an outcome whose own original claim is anything other
+	// than a clean CollectionOK/Complete:true finish for this EXACT
+	// identity has that exact terminal state (Status/Complete/Reason/
+	// Availability/HTTPStatus) faithfully reproduced instead of silently
+	// defaulting to a clean finish it never genuinely reached.
+	if c.originalOutcomes != nil {
+		if original, ok := c.originalOutcomes[outcomeIdentityKey(scope, collectorID, feature)]; ok &&
+			(original.Status != CollectionOK || !original.Complete) {
+			outcome.Status = original.Status
+			outcome.Complete = original.Complete
+			outcome.Reason = original.Reason
+			outcome.Availability = original.Availability
+			outcome.HTTPStatus = original.HTTPStatus
+			return outcome, fmt.Errorf("replay evidence for %s/%s genuinely incomplete at original collection "+
+				"time (reproducing the original run's own recorded terminal state, not a clean finish)", collectorID, feature)
 		}
 	}
 	outcome.Status = CollectionOK

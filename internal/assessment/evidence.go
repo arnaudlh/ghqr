@@ -69,7 +69,9 @@ func (s *EvidenceStore) SaveJSON(raw []byte, metadata EvidenceMetadata) (Evidenc
 		return EvidenceRef{}, fmt.Errorf("sanitize raw evidence: %w", err)
 	}
 	metadata.ContentSHA256 = digestBytes(clean)
-	metadata.Redactions = append(metadata.Redactions, redactions...)
+	if !redactionsAlreadyRecorded(metadata.Redactions, redactions) {
+		metadata.Redactions = append(metadata.Redactions, redactions...)
+	}
 	metaBytes, err := json.Marshal(metadata)
 	if err != nil {
 		return EvidenceRef{}, fmt.Errorf("encode evidence metadata: %w", err)
@@ -158,6 +160,38 @@ func (s *EvidenceStore) LoadJSON(scope Scope, collectorID, feature string) ([]by
 		return nil, EvidenceMetadata{}, EvidenceRef{}, fmt.Errorf("replay bundle needs sanitized re-import before use")
 	}
 	return clean, metadata, ref, nil
+}
+
+// redactionsAlreadyRecorded reports whether fresh (already sorted,
+// deterministic for identical raw bytes) redaction paths are already the
+// trailing entries of metadata's existing Redactions history, so SaveJSON
+// can skip re-appending them. Redactor.JSON always recomputes the complete
+// redaction-path set for its input from scratch and sorts it, so saving the
+// exact same raw content twice (for example a genuine re-collection whose
+// metadata round-tripped forward a prior save's own Redactions) yields the
+// identical fresh slice both times; without this check, each such resave
+// would append a duplicate copy, growing Redactions (and with it the
+// content-addressed object identity) forever even though nothing new was
+// ever actually redacted. This only ever recognizes an EXACT, in-order
+// repeat of the full fresh slice as the array's own tail -- it never
+// dedupes, reorders, or otherwise rewrites any entry already present
+// earlier in Redactions, so legacy history containing its own genuine
+// pre-existing duplicate entries (from before this safeguard existed) is
+// preserved byte-for-byte on every future save.
+func redactionsAlreadyRecorded(existing, fresh []string) bool {
+	if len(fresh) == 0 {
+		return true
+	}
+	if len(existing) < len(fresh) {
+		return false
+	}
+	tail := existing[len(existing)-len(fresh):]
+	for index, path := range fresh {
+		if tail[index] != path {
+			return false
+		}
+	}
+	return true
 }
 
 func validateEvidenceIdentity(scope Scope, collectorID, feature string) error {

@@ -990,7 +990,7 @@ func TestMaterializeExactReplaySourceRejectsTruncatedPaginationClaim(t *testing.
 		return // Rejecting the shortened page inventory is the safe outcome.
 	}
 	t.Cleanup(func() { _ = frozen.Close() })
-	replay, err := NewReplayCollectionClient(Target{Host: scope.Host, Deployment: Server}, RESTEvidence, client.profile, frozen, SystemClock{})
+	replay, err := NewReplayCollectionClient(Target{Host: scope.Host, Deployment: Server}, RESTEvidence, client.profile, frozen, SystemClock{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1230,6 +1230,70 @@ func TestCompareOrganizationOperationalRejectsAuditWindowTamper(t *testing.T) {
 	}
 }
 
+// TestCompareOrganizationOperationalAcceptsGenuineEmptyTeamRosterSerializationRoundTrip
+// proves normalizeEmptyTeamRoster's exact, narrow purpose: Teams carries
+// `omitempty`, so a report that round-tripped through JSON decodes a
+// genuinely-observed, confirmed-zero-team roster back as nil, while this
+// run's own freshly, independently in-memory-collected replay result still
+// holds the exact same roster as a non-nil, zero-length slice (as
+// FetchOrgTeams/collectJSONArray always build on a successful,
+// zero-result page) -- the identical JSON, the identical roster, so this
+// must never be reported as a mismatch.
+func TestCompareOrganizationOperationalAcceptsGenuineEmptyTeamRosterSerializationRoundTrip(t *testing.T) {
+	claimed := &OrganizationOperationalResult{Teams: nil, Roles: &OrgRolesResult{Roles: []roleAssignment{}}}
+	replayed := &OrganizationOperationalResult{Teams: []teamSummary{}, Roles: &OrgRolesResult{Roles: []roleAssignment{}}}
+	if failures := compareOrganizationOperational("github.com/organization/fixture-org", claimed, replayed); len(failures) != 0 {
+		t.Fatalf("genuine nil-vs-empty-slice Teams serialization artifact was reported as a mismatch: %v", failures)
+	}
+	// The reverse nil-ness pairing must also be accepted.
+	claimed.Teams, replayed.Teams = []teamSummary{}, nil
+	if failures := compareOrganizationOperational("github.com/organization/fixture-org", claimed, replayed); len(failures) != 0 {
+		t.Fatalf("genuine empty-slice-vs-nil Teams serialization artifact was reported as a mismatch: %v", failures)
+	}
+}
+
+// TestCompareOrganizationOperationalRejectsGenuineTeamRosterDivergence
+// proves the Teams normalization is surgical: it only ever closes the
+// nil-vs-empty-slice gap when BOTH sides already independently agree the
+// roster is zero-length, and never masks any other, genuine divergence --
+// a team actually added or removed, a team's own member/repo counts
+// differing, or a claimed non-empty roster where replay's own
+// independently-collected source could only ever be nil (the "unknown
+// source" tamper case, which must never be laundered through this
+// normalization into looking like an accepted confirmed-empty roster).
+func TestCompareOrganizationOperationalRejectsGenuineTeamRosterDivergence(t *testing.T) {
+	baseline := []teamSummary{{Slug: "platform", Privacy: "closed", MembersCount: 3, ReposCount: 2, Repos: []teamRepoAccess{}, ReposComplete: true}}
+	cases := map[string]struct {
+		claimed, replayed []teamSummary
+	}{
+		"team added": {
+			claimed:  append(append([]teamSummary{}, baseline...), teamSummary{Slug: "extra", Privacy: "secret", Repos: []teamRepoAccess{}, ReposComplete: true}),
+			replayed: baseline,
+		},
+		"team removed": {
+			claimed:  baseline,
+			replayed: nil,
+		},
+		"different member count": {
+			claimed:  baseline,
+			replayed: []teamSummary{{Slug: "platform", Privacy: "closed", MembersCount: 9, ReposCount: 2, Repos: []teamRepoAccess{}, ReposComplete: true}},
+		},
+		"unknown source tamper: claimed nonempty, replay independently established none": {
+			claimed:  baseline,
+			replayed: nil,
+		},
+	}
+	for name, testCase := range cases {
+		t.Run(name, func(t *testing.T) {
+			claimed := &OrganizationOperationalResult{Teams: testCase.claimed}
+			replayed := &OrganizationOperationalResult{Teams: testCase.replayed}
+			if failures := compareOrganizationOperational("github.com/organization/fixture-org", claimed, replayed); len(failures) == 0 {
+				t.Fatalf("genuine team roster divergence (%s) was masked by the nil-vs-empty-slice normalization", name)
+			}
+		})
+	}
+}
+
 // preResponseConnectionFailureTransport wraps a transport, deliberately
 // failing a specific request path before any HTTP response is ever
 // observed (mirroring a genuine DNS/connection-level failure a real
@@ -1432,5 +1496,179 @@ func TestMaterializeExactReplaySourceAcceptsImportOnlyBareFeatureOutcome(t *test
 	}
 	if !bytes.Contains(raw, []byte("imported")) || loaded.CollectorID != "manual.document" {
 		t.Fatalf("seeded import evidence does not match the original: raw=%s metadata=%+v", raw, loaded)
+	}
+}
+
+// TestMaterializeExactReplaySourceAcceptsGenuinePartialWithInvalidNextLink
+// proves the terminal-pagination-proof check (pageProvablyTerminal) is only
+// ever required when an outcome itself claims a clean, complete finish
+// (Status:CollectionOK, Complete:true): a genuine single-page success (HTTP
+// 200, a valid record count) followed by a malformed/invalid Link header on
+// its own next-page attempt is an honest CollectionPartial/Complete:false
+// claim with Reason "pagination next link is invalid" -- it never claims to
+// have finished cleanly, so it must be reconstructed faithfully as the
+// genuine partial result it is, never rejected merely because its own last
+// page's terminal proof happens to be unknown (nil, from the exact same
+// invalid-link condition). The SAME last-page metadata relabeled to a false
+// clean/complete claim (the established truncation-forgery attack) must
+// still be rejected exactly as before.
+func TestMaterializeExactReplaySourceAcceptsGenuinePartialWithInvalidNextLink(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Link", "<https://outside.invalid/orgs/fixture-org/repos>; rel=\"next\"")
+		writeJSON(t, writer, []map[string]any{{"id": 1}})
+	}))
+	t.Cleanup(server.Close)
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	source := evidenceFixtureStore(t, t.TempDir(), nil)
+	scope := Scope{Host: client.base.Hostname(), Kind: OrganizationScope, Name: "fixture-org"}
+	outcome, collectionErr := client.CollectGET(context.Background(), source, scope, "org.repos", "inventory", "orgs/fixture-org/repos", "", true)
+	if collectionErr == nil || outcome.Pages != 1 || outcome.Status != CollectionPartial || outcome.Complete {
+		t.Fatalf("fixture did not exercise a genuine invalid-next-link partial outcome: %+v err=%v", outcome, collectionErr)
+	}
+
+	// The genuine, HONEST partial claim must replay cleanly, never rejected.
+	genuineReplaySource, err := materializeExactReplaySource(source, client.profile,
+		&VerticalSliceReport{Outcomes: []CollectorOutcome{outcome}}, true, t.TempDir())
+	if err != nil {
+		t.Fatalf("a genuine, honestly-disclosed partial outcome (invalid next link) must seed cleanly, "+
+			"never rejected for lacking terminal proof it never claimed: %v", err)
+	}
+	_ = genuineReplaySource.Close()
+
+	// The SAME outcome relabeled to a false clean/complete claim (the
+	// established truncation-forgery attack) must still be rejected.
+	forged := outcome
+	forged.Status, forged.Complete, forged.Reason = CollectionOK, true, ""
+	if frozen, err := materializeExactReplaySource(source, client.profile,
+		&VerticalSliceReport{Outcomes: []CollectorOutcome{forged}}, true, t.TempDir()); err == nil {
+		_ = frozen.Close()
+		t.Fatal("relabeling the same unproven-terminal page as a clean, complete claim must still be rejected")
+	}
+}
+
+// injectInvalidNextLinkTransport wraps a transport, adding an invalid
+// (cross-origin) Link rel="next" header to every genuine response for one
+// specific request path -- inducing a REAL CollectGET partial outcome
+// (page 1 genuinely succeeds, the follow-up next-link is invalid) through
+// the actual collection pipeline, rather than hand-constructing an outcome
+// that merely looks the same.
+type injectInvalidNextLinkTransport struct {
+	http.RoundTripper
+	path string
+}
+
+func (transport injectInvalidNextLinkTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := transport.RoundTripper.RoundTrip(request)
+	if err != nil || response == nil || request.URL.Path != transport.path {
+		return response, err
+	}
+	response.Header.Set("Link", "<https://outside.invalid"+transport.path+"?page=2>; rel=\"next\"")
+	return response, err
+}
+
+// TestFullPipelineReplayFaithfullyReproducesGenuinePartialPaginationOutcome
+// is the full end-to-end proof requested beyond the materialization-only
+// check: a genuine org.repos outcome (page 1 succeeds for real, its own
+// next-link is genuinely invalid) must replay through the COMPLETE
+// ReplayVerticalSlice/RunVerifiedOfflineEvaluation pipeline reproducing the
+// SAME Partial/incomplete terminal state it genuinely claimed -- not
+// silently upgraded to a clean, complete finish by collectFromReplay's own
+// "ran out of stored pages" fallthrough merely because nothing more is
+// stored (which looks identical, from stored-page presence alone, to a
+// genuinely clean ending). The SAME underlying evidence relabeled to a
+// false clean/complete claim must still be rejected (materialization-level
+// terminal-proof gate, proven independently by
+// TestMaterializeExactReplaySourceAcceptsGenuinePartialWithInvalidNextLink,
+// reconfirmed here through the full pipeline too).
+func TestFullPipelineReplayFaithfullyReproducesGenuinePartialPaginationOutcome(t *testing.T) {
+	profile := fixtureProfileWithDefault(t)
+	server := newVerticalSliceFixtureServer(t)
+	client := collectionFixtureClient(t, server, fixtureBudget(t), SystemClock{})
+	transport, ok := client.http.Transport.(*readTransport)
+	if !ok {
+		t.Fatal("fixture transport does not support interception")
+	}
+	transport.wrapped = injectInvalidNextLinkTransport{RoundTripper: transport.wrapped, path: "/orgs/fixture-org/repos"}
+	directory := t.TempDir()
+	store := evidenceFixtureStore(t, directory, nil)
+	target := Target{Host: client.base.Hostname(), Deployment: Server, Organizations: []string{"fixture-org"}}
+	config := &CustomerConfig{
+		Targets: []Target{target}, RepositoryCap: 10, LookbackDays: 90, Concurrency: 1,
+		ProductionEnvRegex: "prod|production|live|release", EvidenceDir: directory,
+	}
+	report, err := runVerticalSliceWithStore(context.Background(), profile, config, []Target{target}, store, SystemClock{},
+		func(Target, EvidenceSource) (*CollectionClient, error) { return client, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var original *CollectorOutcome
+	for index := range report.Outcomes {
+		outcome := &report.Outcomes[index]
+		if outcome.CollectorID == "org.repos" {
+			original = outcome
+			break
+		}
+	}
+	if original == nil || original.Status != CollectionPartial || original.Complete || original.Pages != 1 {
+		t.Fatalf("fixture did not retain a genuine single-page partial org.repos outcome: %+v", original)
+	}
+	if original.Reason == "" {
+		t.Fatal("test fixture assumption broken: expected a disclosed reason for the genuine partial outcome")
+	}
+	ref, err := WriteRunCollectionContextWithOutcomes(store, profile, config, []Target{target}, report.CollectedAt, report.Outcomes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report.ContextRef = ref
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	replayed, bound, err := ReplayVerticalSlice(context.Background(), profile, report, directory)
+	if err != nil || !bound {
+		t.Fatalf("genuine partial fixture did not replay: bound=%v err=%v", bound, err)
+	}
+	var replayedOutcome *CollectorOutcome
+	for index := range replayed.Outcomes {
+		outcome := &replayed.Outcomes[index]
+		if outcome.CollectorID == "org.repos" {
+			replayedOutcome = outcome
+			break
+		}
+	}
+	if replayedOutcome == nil {
+		t.Fatal("replay lost the org.repos outcome entirely")
+	}
+	if replayedOutcome.Status != CollectionPartial || replayedOutcome.Complete {
+		t.Fatalf("collectFromReplay silently upgraded a genuine, honestly-disclosed partial outcome to a clean, "+
+			"complete finish merely because no further page was stored: claimed=%+v replayed=%+v", original, replayedOutcome)
+	}
+	if replayedOutcome.Reason != original.Reason {
+		t.Fatalf("replay did not preserve the original partial outcome's own disclosed reason: claimed=%q replayed=%q",
+			original.Reason, replayedOutcome.Reason)
+	}
+
+	output := filepath.Join(t.TempDir(), "out")
+	summary, err := RunVerifiedOfflineEvaluation(profile, report, config, output, directory)
+	if err != nil {
+		t.Fatalf("a genuine, honestly-disclosed partial run must be accepted as verified, not refused: %v", err)
+	}
+	if summary.EvidenceVerification == nil || !summary.EvidenceVerification.Verified {
+		t.Fatalf("a genuine partial run with an exactly-bound original outcome inventory must verify: %+v", summary.EvidenceVerification)
+	}
+
+	// The SAME underlying evidence, relabeled to a false clean/complete
+	// claim, must still be rejected (materialization-level terminal-proof
+	// gate; reconfirmed here through the full pipeline).
+	forgedReport := *report
+	forgedOutcomes := append([]CollectorOutcome{}, report.Outcomes...)
+	for index := range forgedOutcomes {
+		if forgedOutcomes[index].CollectorID == "org.repos" {
+			forgedOutcomes[index].Status, forgedOutcomes[index].Complete, forgedOutcomes[index].Reason = CollectionOK, true, ""
+		}
+	}
+	forgedReport.Outcomes = forgedOutcomes
+	if _, _, err := ReplayVerticalSlice(context.Background(), profile, &forgedReport, directory); err == nil {
+		t.Fatal("relabeling the genuine invalid-next-link partial outcome as a clean, complete claim must still be rejected")
 	}
 }
